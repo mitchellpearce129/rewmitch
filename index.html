@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>REWMitch</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#0a0a0d" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <meta name="apple-mobile-web-app-title" content="REWMitch" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>REWMitch</h1>
+    <p class="sub">Relative FR · phase · group delay · driver-offset · waterfall — computed on-device.
+      Not a calibrated SPL meter.</p>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="measure" class="active">Measure</button>
+    <button data-tab="traces">Traces</button>
+    <button data-tab="setup">Setup / Help</button>
+  </nav>
+
+  <!-- ================= MEASURE ================= -->
+  <section id="tab-measure" class="tab active">
+
+    <div class="card init-card">
+      <button id="btnInit" class="primary">Enable Mic &amp; Audio</button>
+      <p id="status" class="status">Tap to grant mic access (needs HTTPS or localhost).</p>
+      <p id="micInfo" class="mic-info"></p>
+    </div>
+
+    <div class="card" id="deviceCard">
+      <label class="dev-label">Input device
+        <select id="inputDevice"><option>— enable mic first —</option></select>
+      </label>
+      <div class="cal-row">
+        <label class="file-btn">📄 Load mic calibration file
+          <input id="calFile" type="file" accept=".txt,.frd,.cal,.csv,text/plain" hidden />
+        </label>
+        <button id="calClear" class="secondary cal-clear">Clear</button>
+      </div>
+      <p id="calStatus" class="hint">No calibration loaded — measurements are relative (uncalibrated mic).
+        Load a UMIK/REW <code>.txt</code>/<code>.frd</code> to correct magnitude.</p>
+    </div>
+
+    <div class="card">
+      <div class="mode-row" id="modeRow">
+        <button data-mode="standard" class="mode active">Standard</button>
+        <button data-mode="nearfield" class="mode">Nearfield</button>
+        <button data-mode="offset" class="mode">Driver-Offset</button>
+        <button data-mode="distortion" class="mode">Distortion</button>
+        <button data-mode="waterfall" class="mode">Waterfall</button>
+      </div>
+      <p id="modeHint" class="hint"></p>
+    </div>
+
+    <div class="card">
+      <div class="meter-wrap">
+        <span class="meter-label">Input</span>
+        <div class="meter"><div id="meterBar" class="meter-bar"></div></div>
+        <span id="meterText" class="meter-text">—</span>
+      </div>
+      <button id="btnPlay" class="primary big" disabled>▶ Play Sweep</button>
+      <button id="btnSanity" class="secondary" disabled>Repeatability check</button>
+      <p id="measureStatus" class="status"></p>
+    </div>
+
+    <!-- mode-specific controls injected here -->
+    <div id="modePanel"></div>
+
+    <div class="card plot-card">
+      <div class="view-toggle">
+        <button data-view="mag" class="active">Magnitude</button>
+        <button data-view="phase">Phase</button>
+        <button data-view="gd">Group delay</button>
+      </div>
+      <canvas id="plot"></canvas>
+      <div class="hold-row">
+        <input id="traceName" type="text" placeholder="Trace name (e.g. baseline)" />
+        <button id="btnHold" class="secondary" disabled>Hold / Add to overlay</button>
+      </div>
+    </div>
+
+    <details class="card">
+      <summary>Sweep &amp; analysis settings</summary>
+      <div class="settings-grid">
+        <label>Start freq (Hz)<input id="f1" type="number" value="20" min="10" max="500" /></label>
+        <label>End freq (Hz)<input id="f2" type="number" value="20000" min="1000" max="24000" /></label>
+        <label>Duration (s)<input id="duration" type="number" value="5" min="1" max="15" step="0.5" /></label>
+        <label>Output level<input id="level" type="range" min="0" max="1" step="0.01" value="0.5" /></label>
+        <label>Gate pre (ms)<input id="gatePre" type="number" value="1" min="0" max="10" step="0.5" /></label>
+        <label>Gate post (ms)<input id="gatePost" type="number" value="5" min="1" max="50" step="0.5" /></label>
+        <label>Smoothing
+          <select id="smoothing">
+            <option value="0">None</option>
+            <option value="3">1/3 octave</option>
+            <option value="6" selected>1/6 octave</option>
+            <option value="12">1/12 octave</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint">Valid above <span id="gateFloor">200</span> Hz · sample rate
+        <span id="sampleRate">—</span> Hz</p>
+    </details>
+  </section>
+
+  <!-- ================= TRACES ================= -->
+  <section id="tab-traces" class="tab">
+    <div class="card">
+      <h2>Held traces</h2>
+      <p class="hint">Freeze a trace, change a component, drop the next one on top. This overlay
+        is the whole point (spec §5).</p>
+      <div id="traceList" class="trace-list"><p class="empty">No traces held yet.</p></div>
+    </div>
+  </section>
+
+  <!-- ================= SETUP / HELP ================= -->
+  <section id="tab-setup" class="tab">
+    <div class="card">
+      <h2>Signal chain</h2>
+      <pre class="chain">
+ iPhone/laptop ─(wired DAC)─▶ amp LINE in ─▶ speakers ─▶ room ─▶ built-in mic
+      │                                                              │
+      └──────────── generates sweep                 records return ──┘</pre>
+      <ul class="help">
+        <li><strong>Wired output only — never Bluetooth.</strong> A2DP re-encodes through a lossy
+          codec that bakes an uncontrolled EQ and time-smear into every trace. Latency is
+          survivable; codec colouration is fatal.</li>
+        <li><strong>Line-level input only</strong> (Aux / CD / Tape). <strong>Never phono/turntable</strong>
+          — it applies RIAA EQ and wrecks the signal.</li>
+        <li>iPhone 15+ : USB-C DAC → 3.5mm-to-RCA → line in. iPhone 14− : Lightning-to-3.5mm → RCA.</li>
+        <li>Mic = the device's own built-in mic, at the listening position (or near the cone for
+          Nearfield / bass work).</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Validity &amp; the honesty caveats</h2>
+      <ul class="help">
+        <li>This is a <strong>relative</strong> bench, not a calibrated SPL meter. No absolute FR,
+          no SPL, no impedance. Mic error is a magnitude error — so timing/phase and A/B
+          comparisons are immune.</li>
+        <li><strong>Biggest risk:</strong> Safari/Chrome may quietly re-apply AGC / noise-suppression /
+          echo-cancellation despite our constraints. Run the <em>Repeatability check</em> — two
+          back-to-back sweeps should overlay within ~1 dB. If they don't, the input is being
+          processed and the numbers can't be trusted.</li>
+        <li>Gate length sets the low-frequency limit: valid above ≈ 1000 / (gate-post ms) Hz.
+          For bass, use <strong>Nearfield</strong> mode (mic at the cone) to dodge the room.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Mic calibration &amp; using a UMIK</h2>
+      <ul class="help">
+        <li>The <strong>phone/laptop mic is uncalibrated</strong> — its error is a <em>magnitude</em>
+          error, so timing, phase, driver-offset and A/B comparisons are already valid. What's NOT
+          valid is the absolute <em>shape</em> of the frequency response.</li>
+        <li>Load a <strong>calibration file</strong> (miniDSP UMIK <code>.txt</code>, or REW/generic
+          <code>.frd</code>/<code>.cal</code>) on the Measure tab to correct the magnitude shape.
+          With a <strong>UMIK-1</strong> plugged into a laptop's USB and selected as the Input device,
+          you get a genuinely <strong>calibrated relative frequency response</strong> — the kind that
+          drops into VituixCAD.</li>
+        <li><strong>For VituixCAD, the hard part is timing between drivers, not magnitude.</strong> A
+          UMIK is a single USB channel, so it can't do a dual-channel loopback timing reference. Use
+          the <strong>Driver-Offset</strong> mode here to get the acoustic z-offset in mm directly —
+          that's the number VituixCAD asks for and most people just guess. Measure each driver from a
+          fixed mic position and don't move the mic between captures.</li>
+        <li><strong>Absolute SPL is still out of scope.</strong> The UMIK's Sens Factor is read and
+          shown, but a browser can't reliably know the input gain chain, so this stays a
+          calibrated-<em>relative</em> bench. For true SPL, use REW on a computer.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer><span id="secureWarn"></span></footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
