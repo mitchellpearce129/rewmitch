@@ -303,6 +303,79 @@ export function harmonicDistortion(recording, sweep, f1, f2, duration, sampleRat
   return { freq, fundamentalDb, ref, harmonics, thd, maxThd, linPeak, sampleRate };
 }
 
+// --- 8c. Acoustic timing reference (driver-offset-reference-spec P1) --------
+// Self-referenced captures: in ONE recording we hear a fixed reference marker
+// (a short HF chirp on the reference channel/speaker) AND the driver's swept
+// response. Because both events share the same per-capture play/record latency,
+// measuring the driver arrival RELATIVE to the reference arrival cancels that
+// latency — which is the ~0.2–0.3 ms iOS jitter that made absolute peak-timing
+// unusable. z_offset = (t_driverB − t_refB) − (t_driverA − t_refA).
+
+// Short Hann-windowed 2–4 kHz chirp — sharp cross-correlation, easy to separate
+// from the low-frequency start of the main sweep.
+export function generateRefMarker(sampleRate, { f1 = 2000, f2 = 4000, durMs = 2 } = {}) {
+  const N = Math.max(2, Math.round((durMs / 1000) * sampleRate));
+  const T = N / sampleRate;
+  const out = new Float32Array(N);
+  for (let n = 0; n < N; n++) {
+    const t = n / sampleRate;
+    const phase = 2 * Math.PI * (f1 * t + ((f2 - f1) / (2 * T)) * t * t); // linear chirp
+    const w = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (N - 1)));          // Hann
+    out[n] = Math.sin(phase) * w;
+  }
+  return out;
+}
+
+// Matched-filter cross-correlation: sub-sample lag where `template` best aligns
+// inside `signal` (i.e. the template's arrival index). Parabolic-interpolated.
+export function crossCorrPeak(signal, template) {
+  const L = nextPow2(signal.length + template.length);
+  const sr = new Float32Array(L), si = new Float32Array(L);
+  const tr = new Float32Array(L), ti = new Float32Array(L);
+  sr.set(signal); tr.set(template);
+  fft(sr, si); fft(tr, ti);
+  const cr = new Float32Array(L), ci = new Float32Array(L);
+  for (let i = 0; i < L; i++) {
+    cr[i] = sr[i] * tr[i] + si[i] * ti[i]; // Re(S·conj(T))
+    ci[i] = si[i] * tr[i] - sr[i] * ti[i]; // Im(S·conj(T))
+  }
+  ifft(cr, ci);
+  let idx = 0, max = 0;
+  for (let i = 0; i < signal.length; i++) { const a = Math.abs(cr[i]); if (a > max) { max = a; idx = i; } }
+  if (idx > 0 && idx < signal.length - 1) {
+    const a = Math.abs(cr[idx - 1]), b = Math.abs(cr[idx]), c = Math.abs(cr[idx + 1]);
+    const den = a - 2 * b + c;
+    if (den !== 0) return idx + (0.5 * (a - c)) / den;
+  }
+  return idx;
+}
+
+// One self-referenced capture → offset (samples) of driver arrival relative to
+// the reference marker arrival, both measured inside the same recording.
+export function selfReferencedOffset(recording, sweep, marker, sampleRate) {
+  const ir = deconvolve(recording, sweep);
+  const tDriver = findPeakSubSample(ir);
+  // The marker is emitted BEFORE the sweep, so it arrives before tDriver.
+  // Restrict the cross-correlation to [0, tDriver) — otherwise the sweep's own
+  // pass through the marker's 2–4 kHz band (much later in the sweep) can win the
+  // correlation and wreck the reference timing.
+  const searchEnd = Math.max(marker.length + 1, Math.min(recording.length, Math.floor(tDriver)));
+  const tRef = crossCorrPeak(recording.subarray(0, searchEnd), marker);
+  return { tRef, tDriver, offsetSamples: tDriver - tRef };
+}
+
+export function samplesToMm(samples, sampleRate, c = 343) {
+  return (samples / sampleRate) * c * 1000;
+}
+
+export function meanStd(arr) {
+  const n = arr.length;
+  if (!n) return { mean: 0, std: 0 };
+  const mean = arr.reduce((a, b) => a + b, 0) / n;
+  const variance = arr.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
+  return { mean, std: Math.sqrt(variance) };
+}
+
 // --- 9. Cumulative spectral decay (basic waterfall, spec §5) ---------------
 // Successively shift the window into the IR tail and FFT each slice.
 export function waterfall(ir, peakIdx, sampleRate, slices = 12, stepMs = 0.3, winMs = 5) {

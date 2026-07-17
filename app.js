@@ -4,6 +4,8 @@ import * as audio from './audio.js';
 import { Plot, TRACE_COLORS } from './plot.js';
 import { traceToFrd, downloadText, downloadCanvasPng, safeName } from './export.js';
 import * as cal from './cal.js';
+import { passesTweeterGate } from './safety.js';
+import { session } from './session.js';
 
 // Register the service worker so REWMitch installs as a PWA and runs offline.
 // Relative path → scope is the hosting directory (works under a GitHub Pages
@@ -24,7 +26,7 @@ const state = {
   current: null,      // latest live result
   traces: [],         // held traces
   colorIdx: 0,
-  offset: { irA: null, irB: null },
+  offset: { useRef: true, refChannel: 'L', averages: 8, dataA: null, dataB: null },
   maxHarmonic: 5,
   cal: null, // parsed mic calibration, or null
 };
@@ -32,6 +34,14 @@ const state = {
 // Correction fn for the current cal file (dB to subtract at a given Hz), or null.
 function calFn() {
   return state.cal ? (f) => cal.calValueAt(state.cal, f) : null;
+}
+
+// PRIORITY 0 tweeter gate now lives in safety.js (shared with the wizard).
+// This reads the manual UI's selector; the wizard drives the gate with its own
+// per-driver types.
+function currentDriverType() {
+  const el = $('#driverType');
+  return el ? el.value : 'full';
 }
 
 const plot = new Plot($('#plot'));
@@ -51,7 +61,7 @@ document.querySelectorAll('.tabs button').forEach((b) => {
 const MODE_HINTS = {
   standard: 'Gated far-field response. Mic at the listening position. Valid above the gate floor.',
   nearfield: 'Mic close to the cone — dodges the room, no calibration needed. Good for bass / baffle-step / sub hand-off. Gate widened automatically.',
-  offset: 'The jewel: measure each driver in turn from a FIXED mic position (disconnect the others at the terminals). Reports the arrival-time difference in mm — the acoustic z-offset VituixCAD wants.',
+  offset: 'The jewel: with the timing reference on, each capture is self-referenced against a fixed reference speaker, so play/record latency jitter cancels. Measures the acoustic z-offset in mm with an honest ± error bar.',
   distortion: 'THD vs frequency (Farina harmonic separation). White = fundamental, coloured = each harmonic at its true level below it. Good for gross breakup, not subtle stuff — limited by the mic\'s own distortion floor.',
   waterfall: 'Cumulative spectral decay from the same IR — shows resonant ringing: "did the notch actually kill it?"',
 };
@@ -105,6 +115,7 @@ $('#btnInit').addEventListener('click', async () => {
     $('#status').textContent = 'Requesting mic…';
     state.ctx = await audio.createAudioContext();
     state.micStream = await audio.getMicStream();
+    session.ctx = state.ctx; session.micStream = state.micStream; // publish for the wizard
     $('#sampleRate').textContent = state.ctx.sampleRate;
     const info = audio.describeMicTrack(state.micStream);
     const flags = `AGC:${info.autoGainControl} · NS:${info.noiseSuppression} · EC:${info.echoCancellation}`;
@@ -144,6 +155,7 @@ $('#inputDevice').addEventListener('change', async () => {
     if (state.stopMeter) state.stopMeter();
     if (state.micStream) state.micStream.getTracks().forEach((t) => t.stop());
     state.micStream = await audio.getMicStream(id);
+    session.micStream = state.micStream; // keep the wizard's session in sync
     const info = audio.describeMicTrack(state.micStream);
     $('#micInfo').textContent = `${info.label || 'mic'}  (AGC:${info.autoGainControl} · NS:${info.noiseSuppression} · EC:${info.echoCancellation})`;
     startMeter();
@@ -158,6 +170,7 @@ $('#calFile').addEventListener('change', async (e) => {
   if (!file) return;
   try {
     state.cal = cal.parseCalFile(await file.text());
+    session.cal = state.cal; // share the calibration with the wizard
     const sens = state.cal.sensFactor != null ? ` · Sens ${state.cal.sensFactor} dB` : '';
     $('#calStatus').textContent = `✓ ${file.name} · ${state.cal.points} points${sens}. Magnitude is now mic-corrected.`;
     $('#calStatus').classList.add('captured');
@@ -169,6 +182,7 @@ $('#calFile').addEventListener('change', async (e) => {
 });
 $('#calClear').addEventListener('click', () => {
   state.cal = null;
+  session.cal = null;
   $('#calFile').value = '';
   $('#calStatus').textContent = 'No calibration loaded — measurements are relative (uncalibrated mic).';
   $('#calStatus').classList.remove('captured');
@@ -215,6 +229,7 @@ async function measure(label = 'Measuring…') {
 }
 
 $('#btnPlay').addEventListener('click', async () => {
+  if (!(await passesTweeterGate(currentDriverType()))) return; // P0 safety gate — no audio unless confirmed
   $('#btnPlay').disabled = true;
   try {
     if (state.mode === 'distortion') {
@@ -242,6 +257,7 @@ $('#btnPlay').addEventListener('click', async () => {
 
 // ---------- Repeatability sanity check (spec §3 / milestone 1) ----------
 $('#btnSanity').addEventListener('click', async () => {
+  if (!(await passesTweeterGate(currentDriverType()))) return; // P0 safety gate
   $('#btnSanity').disabled = true;
   try {
     const a = await measure('Repeatability 1/2…');
@@ -387,31 +403,106 @@ function renderModePanel() {
 
   if (state.mode !== 'offset') return;
   el.className = 'card mode-panel';
+  const o = state.offset;
+  const typeOpts = (sel) => [['woofer', 'Woofer'], ['midrange', 'Midrange'], ['tweeter', 'Tweeter ⚠']]
+    .map(([v, l]) => `<option value="${v}"${v === sel ? ' selected' : ''}>${l}</option>`).join('');
   el.innerHTML = `
     <h2>Driver time-offset</h2>
-    <p class="hint">Fixed mic. Capture each driver alone, then compute.</p>
-    <div class="capture-row">
+    <label class="ref-toggle"><input type="checkbox" id="useRef"${o.useRef ? ' checked' : ''}/>
+      Use timing reference (recommended)</label>
+    <div id="refControls"${o.useRef ? '' : ' style="display:none"'}>
+      <div class="ref-row">
+        <label class="driver-type-row">Reference channel
+          <select id="refChannel">
+            <option value="L"${o.refChannel === 'L' ? ' selected' : ''}>Left = reference speaker</option>
+            <option value="R"${o.refChannel === 'R' ? ' selected' : ''}>Right = reference speaker</option>
+          </select></label>
+        <label class="driver-type-row">Averages
+          <input id="avgCount" type="number" min="1" max="32" value="${o.averages}"/></label>
+      </div>
+      <button id="testRef" class="secondary">Test reference</button>
+      <p id="refTestStatus" class="hint">Plays only the marker on the reference speaker; confirms a stable arrival time.</p>
+    </div>
+    <p class="hint">Fixed mic <strong>and</strong> fixed reference speaker. Capture each driver alone
+      (disconnect the others at the terminals). Nothing moves once you start.</p>
+    <div class="offset-driver">
+      <label class="driver-type-row">Driver A is a <select id="typeA">${typeOpts('tweeter')}</select></label>
       <button id="capA" class="secondary">Capture Driver A</button>
+    </div>
+    <div class="offset-driver">
+      <label class="driver-type-row">Driver B is a <select id="typeB">${typeOpts('woofer')}</select></label>
       <button id="capB" class="secondary">Capture Driver B</button>
     </div>
     <p id="offA" class="hint">A: not captured</p>
     <p id="offB" class="hint">B: not captured</p>
-    <button id="computeOffset" class="primary" disabled>Compute offset</button>
+    <div class="capture-row">
+      <button id="computeOffset" class="primary" disabled>Compute offset</button>
+      <button id="offsetRepeat" class="secondary">Repeatability (×2)</button>
+    </div>
     <div id="offsetResult"></div>`;
+
+  $('#useRef').addEventListener('change', (e) => {
+    o.useRef = e.target.checked;
+    $('#refControls').style.display = o.useRef ? '' : 'none';
+    o.dataA = o.dataB = null; // captured data is method-specific — reset on switch
+    $('#offA').textContent = 'A: not captured'; $('#offA').classList.remove('captured');
+    $('#offB').textContent = 'B: not captured'; $('#offB').classList.remove('captured');
+    $('#computeOffset').disabled = true;
+    $('#offsetResult').innerHTML = '';
+  });
+  $('#refChannel').addEventListener('change', (e) => { o.refChannel = e.target.value; });
+  $('#avgCount').addEventListener('change', (e) => { o.averages = Math.max(1, parseInt(e.target.value, 10) || 8); });
   $('#capA').addEventListener('click', () => captureDriver('A'));
   $('#capB').addEventListener('click', () => captureDriver('B'));
+  $('#testRef').addEventListener('click', testReference);
+  $('#offsetRepeat').addEventListener('click', offsetRepeat);
   $('#computeOffset').addEventListener('click', computeOffset);
 }
 
+// Build the stereo playback buffers for one self-referenced capture: marker on
+// the reference channel at t=0, sweep on the other channel after a short gap.
+function buildRefBuffers(sr, s) {
+  const sweep = dsp.generateESS(s.f1, s.f2, s.duration, sr);
+  const marker = dsp.generateRefMarker(sr);
+  const gap = Math.round(0.008 * sr);
+  const tauS = marker.length + gap;
+  const total = tauS + sweep.length;
+  const refCh = new Float32Array(total); refCh.set(marker, 0);
+  const swpCh = new Float32Array(total); swpCh.set(sweep, tauS);
+  const refIsLeft = state.offset.refChannel === 'L';
+  return { left: refIsLeft ? refCh : swpCh, right: refIsLeft ? swpCh : refCh, sweep, marker };
+}
+
+async function oneRefCapture(label) {
+  const s = settings();
+  const sr = state.ctx.sampleRate;
+  $('#measureStatus').textContent = label;
+  const { left, right, sweep, marker } = buildRefBuffers(sr, s);
+  const rec = await audio.playStereoAndRecord(state.ctx, state.micStream, left, right, { tailSec: 1, level: s.level });
+  return { ...dsp.selfReferencedOffset(rec, sweep, marker, sr), sr };
+}
+
 async function captureDriver(which) {
+  const type = $('#type' + which) ? $('#type' + which).value : 'woofer';
+  if (!(await passesTweeterGate(type))) return; // P0 safety gate — fires on the tweeter's capture
   const btn = $('#cap' + which);
   btn.disabled = true;
   try {
-    const res = await measure(`Capturing driver ${which}…`);
-    state.offset['ir' + which] = res;
-    $('#off' + which).textContent = `${which}: captured · peak ${(res.peakIdx / res.sr * 1000).toFixed(2)} ms`;
+    if (state.offset.useRef) {
+      const N = state.offset.averages;
+      const offsets = [];
+      for (let k = 0; k < N; k++) offsets.push((await oneRefCapture(`Driver ${which}: capture ${k + 1}/${N}…`)).offsetSamples);
+      const sr = state.ctx.sampleRate;
+      const { mean, std } = dsp.meanStd(offsets);
+      state.offset['data' + which] = { mean, std, sr };
+      $('#off' + which).textContent = `${which}: ${N} caps · ${dsp.samplesToMm(mean, sr).toFixed(1)} mm (± ${dsp.samplesToMm(std, sr).toFixed(1)} mm)`;
+    } else {
+      const res = await measure(`Capturing driver ${which} (no reference)…`);
+      state.offset['data' + which] = { legacy: true, ir: res.ir, sr: res.sr, peakIdx: res.peakIdx };
+      $('#off' + which).textContent = `${which}: captured · peak ${(res.peakIdx / res.sr * 1000).toFixed(2)} ms (no reference)`;
+    }
     $('#off' + which).classList.add('captured');
-    if (state.offset.irA && state.offset.irB) $('#computeOffset').disabled = false;
+    if (state.offset.dataA && state.offset.dataB) $('#computeOffset').disabled = false;
   } catch (e) {
     $('#off' + which).textContent = `${which}: error ${e.message}`;
   } finally {
@@ -420,13 +511,86 @@ async function captureDriver(which) {
 }
 
 function computeOffset() {
-  const { irA, irB } = state.offset;
-  const r = dsp.driverOffset(irA.ir, irB.ir, irA.sr);
-  const dir = r.dMm >= 0 ? 'B is further from the mic than A' : 'A is further from the mic than B';
-  $('#offsetResult').innerHTML =
-    `<p class="result-big">${Math.abs(r.dMm).toFixed(1)} mm</p>
-     <p class="hint">Δ ${r.dSamples.toFixed(2)} samples · ${r.dMs.toFixed(3)} ms · ${dir}.
-     Use as the acoustic z-offset in VituixCAD.</p>`;
+  const A = state.offset.dataA, B = state.offset.dataB;
+  if (!A || !B) return;
+  const sr = A.sr;
+  if (!A.legacy && !B.legacy) {
+    const zSamples = B.mean - A.mean;
+    const zMm = dsp.samplesToMm(zSamples, sr);
+    const stdMm = dsp.samplesToMm(Math.hypot(A.std, B.std), sr); // combined error bar
+    const absMm = Math.abs(zMm);
+    const dir = zMm >= 0 ? 'Driver B sits further back than Driver A' : 'Driver A sits further back than Driver B';
+    const verdict = stdMm > 15
+      ? '❌ error bar too large — not trustworthy. Check nothing moved and AGC/NS/EC are off.'
+      : stdMm > Math.max(3, absMm * 0.5)
+        ? '⚠ error bar is large relative to the offset — treat as rough.'
+        : '✅ tight spread — trustworthy.';
+    $('#offsetResult').innerHTML =
+      `<p class="result-big">${absMm.toFixed(1)} mm <span class="pm">± ${stdMm.toFixed(1)} mm</span></p>
+       <p class="hint">${dir}. z = ${zSamples.toFixed(2)} samples · ${(zSamples / sr * 1000).toFixed(3)} ms.<br>
+       ${verdict}<br>Enter as the driver's Z position in VituixCAD.</p>`;
+  } else {
+    const r = dsp.driverOffset(A.ir, B.ir, sr);
+    const dir = r.dMm >= 0 ? 'B further from the mic than A' : 'A further from the mic than B';
+    $('#offsetResult').innerHTML =
+      `<p class="result-big">${Math.abs(r.dMm).toFixed(1)} mm</p>
+       <p class="hint">(No reference — absolute peak method, prone to ~0.2–0.3 ms latency jitter.)
+       Δ ${r.dSamples.toFixed(2)} samples · ${r.dMs.toFixed(3)} ms · ${dir}.</p>`;
+  }
+}
+
+async function testReference() {
+  const btn = $('#testRef');
+  btn.disabled = true;
+  try {
+    const sr = state.ctx.sampleRate;
+    const marker = dsp.generateRefMarker(sr);
+    const total = marker.length + Math.round(0.05 * sr);
+    const refCh = new Float32Array(total); refCh.set(marker, 0);
+    const silent = new Float32Array(total);
+    const refIsLeft = state.offset.refChannel === 'L';
+    const arrivals = [];
+    for (let k = 0; k < 2; k++) {
+      $('#refTestStatus').textContent = `Testing reference ${k + 1}/2…`;
+      const rec = await audio.playStereoAndRecord(state.ctx, state.micStream,
+        refIsLeft ? refCh : silent, refIsLeft ? silent : refCh, { tailSec: 0.3, level: settings().level });
+      arrivals.push(dsp.crossCorrPeak(rec, marker) / sr * 1000);
+    }
+    const spread = Math.abs(arrivals[1] - arrivals[0]);
+    $('#refTestStatus').textContent =
+      `Marker detected at ${arrivals[0].toFixed(1)} & ${arrivals[1].toFixed(1)} ms (spread ${spread.toFixed(2)} ms). ` +
+      (spread < 0.5 ? '✅ stable.' : '⚠ unstable — check the reference speaker/cable and that audio isn\'t rerouting.');
+  } catch (e) {
+    $('#refTestStatus').textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function offsetRepeat() {
+  if (!state.offset.useRef) {
+    $('#offsetResult').innerHTML = '<p class="hint">Turn on the timing reference for a meaningful repeatability check.</p>';
+    return;
+  }
+  const type = $('#typeA') ? $('#typeA').value : 'woofer';
+  if (!(await passesTweeterGate(type))) return; // P0 safety gate
+  const btn = $('#offsetRepeat');
+  btn.disabled = true;
+  try {
+    const sr = state.ctx.sampleRate;
+    const r1 = await oneRefCapture('Repeatability 1/2…');
+    const r2 = await oneRefCapture('Repeatability 2/2…');
+    const diffMm = Math.abs(dsp.samplesToMm(r2.offsetSamples - r1.offsetSamples, sr));
+    $('#offsetResult').innerHTML =
+      `<p class="result-big">${diffMm.toFixed(1)} mm</p>
+       <p class="hint">Same driver measured twice · difference.
+       ${diffMm <= 15 ? '✅ pass — the reference is working.' : '⚠ over 15 mm — something moved or the reference is unstable.'}</p>`;
+    $('#measureStatus').textContent = 'Repeatability done.';
+  } catch (e) {
+    $('#offsetResult').innerHTML = '<p class="hint">Error: ' + e.message + '</p>';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ---------- Trace list / export ----------

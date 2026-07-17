@@ -1,10 +1,11 @@
 // sw.js — service worker: caches the app shell so REWMitch installs as a PWA
 // and runs offline. Bump CACHE when you change any app file (forces a refresh).
-const CACHE = 'rewmitch-v1';
+const CACHE = 'rewmitch-v4';
 const ASSETS = [
   './', './index.html', './styles.css',
   './app.js', './audio.js', './cal.js', './dsp.js',
   './export.js', './fft.js', './plot.js',
+  './session.js', './safety.js', './glossary.js', './svg.js', './wizard.js',
   './manifest.json', './icon-192.png', './icon-512.png',
 ];
 

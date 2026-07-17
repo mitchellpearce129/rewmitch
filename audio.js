@@ -101,6 +101,63 @@ export async function playAndRecord(ctx, micStream, sweepBuffer, {
   });
 }
 
+// Stereo play + mono record (driver-offset reference, P1). `left`/`right` are
+// Float32Arrays of equal length — one carries the reference marker, the other
+// the sweep. Records the mic in parallel and returns the mono recording.
+export async function playStereoAndRecord(ctx, micStream, left, right, {
+  tailSec = 1, level = 0.5, onLevel = null,
+} = {}) {
+  const sr = ctx.sampleRate;
+  const len = Math.max(left.length, right.length);
+
+  const buf = ctx.createBuffer(2, len, sr);
+  buf.copyToChannel(left, 0);
+  buf.copyToChannel(right, 1);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const outGain = ctx.createGain();
+  outGain.gain.value = level;
+  src.connect(outGain).connect(ctx.destination);
+
+  const micSrc = ctx.createMediaStreamSource(micStream);
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+
+  const chunks = [];
+  let recording = true;
+  proc.onaudioprocess = (e) => {
+    if (!recording) return;
+    const d = e.inputBuffer.getChannelData(0);
+    const c = new Float32Array(d.length);
+    c.set(d);
+    chunks.push(c);
+    if (onLevel) {
+      let mx = 0;
+      for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > mx) mx = a; }
+      onLevel(mx);
+    }
+  };
+  micSrc.connect(proc);
+  proc.connect(mute);
+  mute.connect(ctx.destination);
+
+  const totalMs = (len / sr + tailSec) * 1000 + 200;
+  return new Promise((resolve) => {
+    src.start();
+    setTimeout(() => {
+      recording = false;
+      try { proc.disconnect(); micSrc.disconnect(); mute.disconnect(); src.disconnect(); } catch (_) {}
+      let n = 0;
+      chunks.forEach((c) => { n += c.length; });
+      const rec = new Float32Array(n);
+      let off = 0;
+      chunks.forEach((c) => { rec.set(c, off); off += c.length; });
+      resolve(rec);
+    }, totalMs);
+  });
+}
+
 // Live input-level meter for the "arm" state (spec §6). Returns a stop handle.
 export function startLevelMeter(ctx, micStream, onLevel) {
   const src = ctx.createMediaStreamSource(micStream);

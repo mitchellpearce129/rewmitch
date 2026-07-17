@@ -21,13 +21,19 @@
   </header>
 
   <nav class="tabs">
-    <button data-tab="measure" class="active">Measure</button>
+    <button data-tab="guide" class="active">Guide</button>
+    <button data-tab="measure">Measure</button>
     <button data-tab="traces">Traces</button>
     <button data-tab="setup">Setup / Help</button>
   </nav>
 
+  <!-- ================= GUIDE (wizard) ================= -->
+  <section id="tab-guide" class="tab active">
+    <div id="wizard"></div>
+  </section>
+
   <!-- ================= MEASURE ================= -->
-  <section id="tab-measure" class="tab active">
+  <section id="tab-measure" class="tab">
 
     <div class="card init-card">
       <button id="btnInit" class="primary">Enable Mic &amp; Audio</button>
@@ -61,6 +67,14 @@
     </div>
 
     <div class="card">
+      <label class="driver-type-row">Driver under test
+        <select id="driverType">
+          <option value="full" selected>Whole speaker (crossover in place)</option>
+          <option value="woofer">Woofer (individual driver)</option>
+          <option value="midrange">Midrange (individual driver)</option>
+          <option value="tweeter">Tweeter (individual driver) ⚠</option>
+        </select>
+      </label>
       <div class="meter-wrap">
         <span class="meter-label">Input</span>
         <div class="meter"><div id="meterBar" class="meter-bar"></div></div>
@@ -179,5 +193,6 @@
   <footer><span id="secureWarn"></span></footer>
 
   <script type="module" src="app.js"></script>
+  <script type="module" src="wizard.js"></script>
 </body>
 </html>
