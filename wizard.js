@@ -120,8 +120,95 @@ async function ensureAudio() {
   for (let i = 0; i < 40 && !session.ctx; i++) await new Promise((r) => setTimeout(r, 200));
   return !!session.ctx;
 }
+function pairHasTweeter(step) {
+  return !!(step && step.pair && (step.pair.a === 'tweeter' || step.pair.b === 'tweeter'));
+}
+// Lazily seed the per-step sweep range. Tweeter-involving steps default to a
+// higher start (extra programmatic protection — the series cap is still the
+// real safeguard); everything else uses the full band.
+function ensureRange(step) {
+  if (step.config.f1 == null) { step.config.f1 = pairHasTweeter(step) ? 500 : 20; }
+  if (step.config.f2 == null) { step.config.f2 = 20000; }
+}
 function wizSettings(step) {
-  return { f1: 20, f2: 20000, duration: 5, level: 0.5, gatePre: 1, gatePost: step && step.testType === 'nearfield' ? 25 : 5, smoothing: 6 };
+  const c = (step && step.config) || {};
+  return { f1: c.f1 || 20, f2: c.f2 || 20000, duration: 5, level: 0.5, gatePre: 1, gatePost: step && step.testType === 'nearfield' ? 25 : 5, smoothing: 6 };
+}
+
+// ---- Level-setting routine (Test levels) ----------------------------------
+const levelTest = { running: false, cur: null };
+function speak(text) {
+  try {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1;
+      window.speechSynthesis.speak(u);
+    }
+  } catch (_) { /* speech optional */ }
+}
+async function runLevelTest(step, statusEl) {
+  if (!(await ensureAudio())) { statusEl.textContent = 'Enable the mic/audio first (a permission prompt should appear).'; return; }
+  const ctx = session.ctx, sr = ctx.sampleRate;
+  const sweep = dsp.generateESS(step.config.f1, step.config.f2, 3, sr); // 3 s, with fades (safer transients)
+  const silence = new Float32Array(sweep.length);
+  levelTest.running = true;
+  while (levelTest.running) {
+    statusEl.textContent = '🔊 Testing LEFT… (set your amp so it\'s comfortably loud, not distorting)';
+    speak('Testing left');
+    levelTest.cur = audio.playStereoOnce(ctx, sweep, silence, 0.5);
+    await levelTest.cur.promise;
+    if (!levelTest.running) break;
+    await new Promise((r) => setTimeout(r, 300));
+    if (!levelTest.running) break;
+    statusEl.textContent = '🔊 Testing RIGHT…';
+    speak('Testing right');
+    levelTest.cur = audio.playStereoOnce(ctx, silence, sweep, 0.5);
+    await levelTest.cur.promise;
+    if (!levelTest.running) break;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  statusEl.textContent = 'Stopped.';
+}
+function showLevelTest(step, onClose) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal" role="dialog" aria-modal="true">
+      <h2 class="modal-title">Test levels</h2>
+      <p class="level-warn">WARNING: If your tweeter is connected directly to the amp and you do not
+        have a capacitor in series protecting it, DO NOT PROCEED!!!</p>
+      <div class="ref-row">
+        <label class="driver-type-row">Sweep start (Hz)<input id="lvlF1" type="number" min="10" max="20000" value="${step.config.f1}"/></label>
+        <label class="driver-type-row">Sweep end (Hz)<input id="lvlF2" type="number" min="100" max="24000" value="${step.config.f2}"/></label>
+      </div>
+      <p class="hint">These limits are also used for the real measurement. Raising the start frequency
+        keeps damaging lows out of a tweeter — extra protection, not a substitute for the series cap.</p>
+      <p id="lvlStatus" class="status"></p>
+      <div class="modal-buttons">
+        <button id="lvlProceed" class="secondary">Proceed</button>
+        <button id="lvlHappy" class="primary">Happy</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const f1 = overlay.querySelector('#lvlF1'), f2 = overlay.querySelector('#lvlF2');
+  const status = overlay.querySelector('#lvlStatus');
+  const sync = () => {
+    step.config.f1 = Math.max(10, parseInt(f1.value, 10) || step.config.f1);
+    step.config.f2 = Math.max(step.config.f1 + 50, parseInt(f2.value, 10) || step.config.f2);
+  };
+  f1.addEventListener('change', sync);
+  f2.addEventListener('change', sync);
+  overlay.querySelector('#lvlProceed').addEventListener('click', () => { sync(); runLevelTest(step, status); });
+  const close = () => {
+    levelTest.running = false;
+    if (levelTest.cur) levelTest.cur.stop();
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    overlay.remove();
+    if (onClose) onClose();
+  };
+  overlay.querySelector('#lvlHappy').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
 async function capLinear(step) {
   const ctx = session.ctx, mic = session.micStream, sr = ctx.sampleRate, s = wizSettings(step);
@@ -137,8 +224,8 @@ async function capLinear(step) {
   mag = dsp.normaliseToBand(spec.freq, mag);
   return { freq: spec.freq, mag, phase: spec.phase, gd: dsp.groupDelayMs(spec.freq, spec.phase), ir, peakIdx, sr, rec, sweep };
 }
-async function capOffset(refChannel) {
-  const ctx = session.ctx, mic = session.micStream, sr = ctx.sampleRate, s = wizSettings();
+async function capOffset(refChannel, s) {
+  const ctx = session.ctx, mic = session.micStream, sr = ctx.sampleRate;
   const sweep = dsp.generateESS(s.f1, s.f2, s.duration, sr);
   const marker = dsp.generateRefMarker(sr);
   const gap = Math.round(0.008 * sr), tauS = marker.length + gap, total = tauS + sweep.length;
@@ -248,6 +335,8 @@ function renderConfig(i) {
   const cfg = st.config;
   cfg.testSpeaker = cfg.testSpeaker || 'R';
   cfg.xo = cfg.xo || (st.pair ? st.pair.xo : 2500);
+  ensureRange(st);
+  const tw = pairHasTweeter(st);
   const activeRoles = st.pair ? [st.pair.a, st.pair.b] : [];
   const needDisconnect = m.pairTest;
   render(`
@@ -263,6 +352,14 @@ function renderConfig(i) {
       ${st.pair ? `<p class="hint">This pair meets at their ${chip('crossoverFreq', 'crossover')}. We only trust the result across the range where both drivers actually play — around the crossover.</p>
         <label class="driver-type-row">Crossover frequency (Hz)
           <input id="cfgXo" type="number" min="100" max="15000" value="${cfg.xo}"/></label>` : ''}
+      ${tw ? `<div class="wiz-warn">
+        <p>This test drives a <strong>tweeter</strong>. As extra protection you can raise the sweep's
+          start frequency to keep damaging lows out of it — but the ${chip('protectionCap', 'series cap')}
+          is the real safeguard.</p>
+        <div class="ref-row">
+          <label class="driver-type-row">Sweep start (Hz)<input id="cfgF1" type="number" min="10" max="20000" value="${cfg.f1}"/></label>
+          <label class="driver-type-row">Sweep end (Hz)<input id="cfgF2" type="number" min="100" max="24000" value="${cfg.f2}"/></label>
+        </div></div>` : ''}
       ${needDisconnect ? `<div class="wiz-warn">
         <p>At the back of the speaker, unscrew the ${chip('terminals', 'binding posts')} and disconnect every driver except the one(s) being measured. If your drivers aren't wired individually, this test needs the ${chip('bypassCrossover', 'crossover bypassed')}.</p>
         <label class="modal-check"><input type="checkbox" id="cfgDisc"/><span>Drivers disconnected (only the one under test is connected).</span></label>
@@ -274,6 +371,10 @@ function renderConfig(i) {
     </div>`);
   $('#cfgSpeaker').addEventListener('change', (e) => { cfg.testSpeaker = e.target.value; renderConfig(i); });
   if (st.pair) $('#cfgXo').addEventListener('change', (e) => { cfg.xo = Math.max(100, parseInt(e.target.value, 10) || cfg.xo); });
+  if (tw) {
+    $('#cfgF1').addEventListener('change', (e) => { cfg.f1 = Math.max(10, parseInt(e.target.value, 10) || cfg.f1); });
+    $('#cfgF2').addEventListener('change', (e) => { cfg.f2 = Math.max(cfg.f1 + 50, parseInt(e.target.value, 10) || cfg.f2); });
+  }
   if (needDisconnect) $('#cfgDisc').addEventListener('change', (e) => { $('#wizGo').disabled = !e.target.checked; });
   $('#wizBack').addEventListener('click', () => renderInfo(i));
   $('#wizGo').addEventListener('click', () => renderCapture(i));
@@ -283,6 +384,7 @@ function renderConfig(i) {
 function renderCapture(i) {
   const st = wiz.plan.steps[i], m = META[st.testType];
   const cfg = st.config;
+  ensureRange(st);
   const refChannel = cfg.testSpeaker === 'L' ? 'R' : 'L'; // reference is the other speaker
   let controls;
   if (m.pairTest) {
@@ -306,6 +408,10 @@ function renderCapture(i) {
     <div class="card wiz-screen">
       <div class="wiz-crumbs">Capture · ${m.title}${st.pair ? ' — ' + st.pair.name : ''}</div>
       <p class="hint">Test speaker: <strong>${cfg.testSpeaker}</strong>${m.needsRef ? ` · reference: <strong>${refChannel}</strong>` : ''}. Keep everything still.</p>
+      <div class="lvl-bar">
+        <span id="lvlRange" class="hint">Sweep: ${cfg.f1}–${cfg.f2} Hz</span>
+        <button id="testLevels" class="secondary">Test levels</button>
+      </div>
       ${controls}
       <canvas id="wizPlot" class="wiz-plot"></canvas>
       <p id="wizStatus" class="status"></p>
@@ -320,6 +426,9 @@ function renderCapture(i) {
   $('#wizBack').addEventListener('click', () => renderConfig(i));
   $('#wizDone').addEventListener('click', () => finishStep(i));
   host().querySelectorAll('[data-cap]').forEach((b) => b.addEventListener('click', () => runCapture(i, b.dataset.cap, plot, refChannel)));
+  $('#testLevels').addEventListener('click', () => showLevelTest(st, () => {
+    const el = $('#lvlRange'); if (el) el.textContent = `Sweep: ${st.config.f1}–${st.config.f2} Hz`;
+  }));
 }
 
 async function runCapture(i, which, plot, refChannel) {
@@ -347,22 +456,23 @@ async function runCapture(i, which, plot, refChannel) {
 
 // ---- Per-test capture flows ----------------------------------------------
 const AVG = 8;
-async function averagedOffset(refChannel, label) {
+async function averagedOffset(refChannel, s, label) {
   const offs = [];
-  for (let k = 0; k < AVG; k++) { $('#wizStatus').textContent = `${label} ${k + 1}/${AVG}…`; offs.push((await capOffset(refChannel)).offsetSamples); }
+  for (let k = 0; k < AVG; k++) { $('#wizStatus').textContent = `${label} ${k + 1}/${AVG}…`; offs.push((await capOffset(refChannel, s)).offsetSamples); }
   return offs;
 }
 async function capOffsetFlow(st, which, plot, refChannel) {
   const sr = session.ctx.sampleRate;
+  const s = wizSettings(st);
   if (which === 'rep') {
-    const o1 = (await capOffset(refChannel)).offsetSamples;
+    const o1 = (await capOffset(refChannel, s)).offsetSamples;
     $('#wizStatus').textContent = 'Repeatability 2/2…';
-    const o2 = (await capOffset(refChannel)).offsetSamples;
+    const o2 = (await capOffset(refChannel, s)).offsetSamples;
     const diff = Math.abs(dsp.samplesToMm(o2 - o1, sr));
     $('#wizResult').innerHTML = `<p class="hint">Repeatability: same driver twice differed by <strong>${diff.toFixed(1)} mm</strong> — ${diff <= 15 ? '✅ good, the reference is working.' : '⚠ over 15 mm; check nothing moved.'}</p>`;
     return;
   }
-  const offs = await averagedOffset(refChannel, `Capturing ${which === 'a' ? ROLE_LABEL[st.pair.a] : ROLE_LABEL[st.pair.b]}`);
+  const offs = await averagedOffset(refChannel, s, `Capturing ${which === 'a' ? ROLE_LABEL[st.pair.a] : ROLE_LABEL[st.pair.b]}`);
   const { mean, std } = dsp.meanStd(offs);
   st.scratch[which] = { mean, std, sr };
   $('#cap' + which.toUpperCase()).textContent = `${which === 'a' ? ROLE_LABEL[st.pair.a] : ROLE_LABEL[st.pair.b]}: ${dsp.samplesToMm(mean, sr).toFixed(1)} mm (± ${dsp.samplesToMm(std, sr).toFixed(1)} mm)`;

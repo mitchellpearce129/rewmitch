@@ -158,6 +158,23 @@ export async function playStereoAndRecord(ctx, micStream, left, right, {
   });
 }
 
+// Play a stereo buffer with NO recording (level-setting routine). Returns a
+// promise that resolves when playback ends, plus a stop() to cut it short.
+export function playStereoOnce(ctx, left, right, level = 0.5) {
+  const len = Math.max(left.length, right.length);
+  const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+  buf.copyToChannel(left, 0);
+  buf.copyToChannel(right, 1);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const g = ctx.createGain();
+  g.gain.value = level;
+  src.connect(g).connect(ctx.destination);
+  const promise = new Promise((resolve) => { src.onended = resolve; });
+  src.start();
+  return { promise, stop: () => { try { src.stop(); } catch (_) {} } };
+}
+
 // Live input-level meter for the "arm" state (spec §6). Returns a stop handle.
 export function startLevelMeter(ctx, micStream, onLevel) {
   const src = ctx.createMediaStreamSource(micStream);
