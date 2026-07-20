@@ -350,18 +350,57 @@ export function crossCorrPeak(signal, template) {
   return idx;
 }
 
+// Bounded, prominence-checked driver-arrival peak for the offset measurement.
+// Searches only [refLag, refLag + maxMs] — a window RELATIVE to the reference
+// marker, so it's immune to hardware play/record latency (which shifts the whole
+// recording) and can never select the FFT circular-convolution wraparound tail.
+// Also rejects captures whose peak isn't clearly above the local noise floor.
+// Returns { pos (sub-sample), snrDb, valid }.
+export function findDriverPeak(ir, sampleRate, { refLag = 0, maxMs = 40, minSnrDb = 12, guardMs = 1 } = {}) {
+  const start = Math.max(0, Math.round(refLag));
+  const end = Math.min(ir.length - 1, start + Math.round((maxMs / 1000) * sampleRate));
+
+  let idx = start, max = 0;
+  for (let i = start; i <= end; i++) {
+    const a = Math.abs(ir[i]);
+    if (a > max) { max = a; idx = i; }
+  }
+
+  // Noise floor = median |ir| across the window, excluding a guard band around
+  // the peak so the peak itself doesn't inflate the floor.
+  const guard = Math.round((guardMs / 1000) * sampleRate);
+  const mags = [];
+  for (let i = start; i <= end; i++) {
+    if (Math.abs(i - idx) <= guard) continue;
+    mags.push(Math.abs(ir[i]));
+  }
+  mags.sort((a, b) => a - b);
+  const noise = mags.length ? mags[Math.floor(mags.length / 2)] : 0;
+  const snrDb = noise > 0 ? 20 * Math.log10(max / noise) : Infinity;
+
+  let pos = idx;
+  if (idx > 0 && idx < ir.length - 1) {
+    const a = Math.abs(ir[idx - 1]), b = Math.abs(ir[idx]), c = Math.abs(ir[idx + 1]);
+    const den = a - 2 * b + c;
+    if (den !== 0) pos = idx + (0.5 * (a - c)) / den;
+  }
+  return { pos, snrDb, valid: snrDb >= minSnrDb };
+}
+
 // One self-referenced capture → offset (samples) of driver arrival relative to
 // the reference marker arrival, both measured inside the same recording.
 export function selfReferencedOffset(recording, sweep, marker, sampleRate) {
   const ir = deconvolve(recording, sweep);
-  const tDriver = findPeakSubSample(ir);
-  // The marker is emitted BEFORE the sweep, so it arrives before tDriver.
-  // Restrict the cross-correlation to [0, tDriver) — otherwise the sweep's own
-  // pass through the marker's 2–4 kHz band (much later in the sweep) can win the
-  // correlation and wreck the reference timing.
-  const searchEnd = Math.max(marker.length + 1, Math.min(recording.length, Math.floor(tDriver)));
-  const tRef = crossCorrPeak(recording.subarray(0, searchEnd), marker);
-  return { tRef, tDriver, offsetSamples: tDriver - tRef };
+  // 1) Find the reference marker in an early, bounded window — latency-generous
+  //    but well before the sweep's own pass through the marker's 2–4 kHz band,
+  //    so the matched filter can't lock onto the sweep instead of the marker.
+  const refWin = Math.min(recording.length, Math.round(0.5 * sampleRate)); // 500 ms
+  const tRef = crossCorrPeak(recording.subarray(0, refWin), marker);
+  // 2) The driver arrives ~tauS after the marker, so search a bounded window
+  //    RELATIVE to tRef (latency-immune, wraparound-safe) with an SNR gate that
+  //    flags scattered/garbage captures instead of turning them into kilometres.
+  const peak = findDriverPeak(ir, sampleRate, { refLag: tRef, maxMs: 40, minSnrDb: 12 });
+  return { tRef, tDriver: peak.pos, offsetSamples: peak.pos - tRef, snrDb: peak.snrDb, valid: peak.valid };
 }
 
 export function samplesToMm(samples, sampleRate, c = 343) {
@@ -374,6 +413,25 @@ export function meanStd(arr) {
   const mean = arr.reduce((a, b) => a + b, 0) / n;
   const variance = arr.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
   return { mean, std: Math.sqrt(variance) };
+}
+
+function median(arr) {
+  const a = [...arr].sort((x, y) => x - y);
+  const n = a.length;
+  if (!n) return NaN;
+  return n % 2 ? a[(n - 1) / 2] : 0.5 * (a[n / 2 - 1] + a[n / 2]);
+}
+
+// Median + MAD outlier rejection, then mean/std of the survivors — so one stray
+// capture that slipped through the SNR gate can't drag the average.
+export function robustMeanStd(arr) {
+  if (!arr.length) return { mean: NaN, std: NaN, kept: 0 };
+  const med = median(arr);
+  const mad = median(arr.map((v) => Math.abs(v - med)));
+  const sigma = 1.4826 * mad; // MAD → robust σ
+  const keep = sigma > 0 ? arr.filter((v) => Math.abs(v - med) <= 3.5 * sigma) : arr.slice();
+  const use = keep.length ? keep : arr;
+  return { ...meanStd(use), kept: use.length };
 }
 
 // --- 9. Cumulative spectral decay (basic waterfall, spec §5) ---------------

@@ -470,16 +470,17 @@ function buildRefBuffers(sr, s) {
   const refCh = new Float32Array(total); refCh.set(marker, 0);
   const swpCh = new Float32Array(total); swpCh.set(sweep, tauS);
   const refIsLeft = state.offset.refChannel === 'L';
-  return { left: refIsLeft ? refCh : swpCh, right: refIsLeft ? swpCh : refCh, sweep, marker };
+  return { left: refIsLeft ? refCh : swpCh, right: refIsLeft ? swpCh : refCh, sweep, marker, tauS };
 }
 
 async function oneRefCapture(label) {
   const s = settings();
   const sr = state.ctx.sampleRate;
   $('#measureStatus').textContent = label;
-  const { left, right, sweep, marker } = buildRefBuffers(sr, s);
+  const { left, right, sweep, marker, tauS } = buildRefBuffers(sr, s);
   const rec = await audio.playStereoAndRecord(state.ctx, state.micStream, left, right, { tailSec: 1, level: s.level });
-  return { ...dsp.selfReferencedOffset(rec, sweep, marker, sr), sr };
+  const res = dsp.selfReferencedOffset(rec, sweep, marker, sr);
+  return { ...res, offsetSamples: res.offsetSamples - tauS, sr }; // physical per-driver readout (tauS cancels in B−A)
 }
 
 async function captureDriver(which) {
@@ -490,12 +491,22 @@ async function captureDriver(which) {
   try {
     if (state.offset.useRef) {
       const N = state.offset.averages;
-      const offsets = [];
-      for (let k = 0; k < N; k++) offsets.push((await oneRefCapture(`Driver ${which}: capture ${k + 1}/${N}…`)).offsetSamples);
       const sr = state.ctx.sampleRate;
-      const { mean, std } = dsp.meanStd(offsets);
+      const offsets = [];
+      for (let k = 0; k < N; k++) {
+        const cap = await oneRefCapture(`Driver ${which}: capture ${k + 1}/${N}…`);
+        if (cap.valid) offsets.push(cap.offsetSamples); // drop low-SNR / garbage captures
+      }
+      if (offsets.length < 3) {
+        state.offset['data' + which] = null;
+        $('#computeOffset').disabled = true;
+        $('#off' + which).textContent = `${which}: ⚠ capture failed (${offsets.length}/${N} usable — bypass crossover, raise level, keep still)`;
+        $('#off' + which).classList.remove('captured');
+        return;
+      }
+      const { mean, std } = dsp.robustMeanStd(offsets);
       state.offset['data' + which] = { mean, std, sr };
-      $('#off' + which).textContent = `${which}: ${N} caps · ${dsp.samplesToMm(mean, sr).toFixed(1)} mm (± ${dsp.samplesToMm(std, sr).toFixed(1)} mm)`;
+      $('#off' + which).textContent = `${which}: ${offsets.length}/${N} caps · ${dsp.samplesToMm(mean, sr).toFixed(1)} mm (± ${dsp.samplesToMm(std, sr).toFixed(1)} mm)`;
     } else {
       const res = await measure(`Capturing driver ${which} (no reference)…`);
       state.offset['data' + which] = { legacy: true, ir: res.ir, sr: res.sr, peakIdx: res.peakIdx };
@@ -580,6 +591,10 @@ async function offsetRepeat() {
     const sr = state.ctx.sampleRate;
     const r1 = await oneRefCapture('Repeatability 1/2…');
     const r2 = await oneRefCapture('Repeatability 2/2…');
+    if (!r1.valid || !r2.valid) {
+      $('#offsetResult').innerHTML = '<p class="hint">⚠ Couldn\'t get a clean capture (weak / low-SNR impulse). Bypass the crossover, raise the level slightly, keep the room quiet, and retry.</p>';
+      return;
+    }
     const diffMm = Math.abs(dsp.samplesToMm(r2.offsetSamples - r1.offsetSamples, sr));
     $('#offsetResult').innerHTML =
       `<p class="result-big">${diffMm.toFixed(1)} mm</p>

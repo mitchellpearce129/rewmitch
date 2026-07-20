@@ -233,7 +233,11 @@ async function capOffset(refChannel, s) {
   const swpCh = new Float32Array(total); swpCh.set(sweep, tauS);
   const refIsLeft = refChannel === 'L';
   const rec = await audio.playStereoAndRecord(ctx, mic, refIsLeft ? refCh : swpCh, refIsLeft ? swpCh : refCh, { tailSec: 1, level: s.level });
-  return { ...dsp.selfReferencedOffset(rec, sweep, marker, sr), sr };
+  // Subtract tauS so the per-driver readout is a physical path difference (the
+  // ~10 ms marker→sweep gap otherwise makes a woofer read ~3400 mm). It cancels
+  // in the final B−A difference, so the Z result is unchanged.
+  const res = dsp.selfReferencedOffset(rec, sweep, marker, sr);
+  return { ...res, offsetSamples: res.offsetSamples - tauS, sr };
 }
 function phaseDeg(rad) {
   const out = new Float32Array(rad.length);
@@ -458,22 +462,37 @@ async function runCapture(i, which, plot, refChannel) {
 const AVG = 8;
 async function averagedOffset(refChannel, s, label) {
   const offs = [];
-  for (let k = 0; k < AVG; k++) { $('#wizStatus').textContent = `${label} ${k + 1}/${AVG}…`; offs.push((await capOffset(refChannel, s)).offsetSamples); }
-  return offs;
+  for (let k = 0; k < AVG; k++) {
+    $('#wizStatus').textContent = `${label} ${k + 1}/${AVG}…`;
+    const cap = await capOffset(refChannel, s);
+    if (cap.valid) offs.push(cap.offsetSamples); // drop low-SNR / garbage captures
+  }
+  return offs; // may be shorter than AVG (or empty) if captures were rejected
 }
 async function capOffsetFlow(st, which, plot, refChannel) {
   const sr = session.ctx.sampleRate;
   const s = wizSettings(st);
   if (which === 'rep') {
-    const o1 = (await capOffset(refChannel, s)).offsetSamples;
+    const c1 = await capOffset(refChannel, s);
     $('#wizStatus').textContent = 'Repeatability 2/2…';
-    const o2 = (await capOffset(refChannel, s)).offsetSamples;
-    const diff = Math.abs(dsp.samplesToMm(o2 - o1, sr));
+    const c2 = await capOffset(refChannel, s);
+    if (!c1.valid || !c2.valid) {
+      $('#wizResult').innerHTML = `<p class="hint">⚠ Couldn't get a clean capture (weak / low-SNR impulse). Bypass the crossover, widen the sweep band, raise the level slightly, keep the room quiet, and retry.</p>`;
+      return;
+    }
+    const diff = Math.abs(dsp.samplesToMm(c2.offsetSamples - c1.offsetSamples, sr));
     $('#wizResult').innerHTML = `<p class="hint">Repeatability: same driver twice differed by <strong>${diff.toFixed(1)} mm</strong> — ${diff <= 15 ? '✅ good, the reference is working.' : '⚠ over 15 mm; check nothing moved.'}</p>`;
     return;
   }
   const offs = await averagedOffset(refChannel, s, `Capturing ${which === 'a' ? ROLE_LABEL[st.pair.a] : ROLE_LABEL[st.pair.b]}`);
-  const { mean, std } = dsp.meanStd(offs);
+  const MIN_GOOD = 3;
+  if (offs.length < MIN_GOOD) {
+    $('#cap' + which.toUpperCase()).textContent = `${which === 'a' ? ROLE_LABEL[st.pair.a] : ROLE_LABEL[st.pair.b]}: ⚠ capture failed (${offs.length}/${AVG} usable)`;
+    $('#cap' + which.toUpperCase()).classList.remove('captured');
+    $('#wizResult').innerHTML = `<p class="hint">⚠ Too few clean captures. Likely causes: crossover still in the signal path, sweep band too narrow/low, level too low, or movement/noise. Fix and retry.</p>`;
+    return;
+  }
+  const { mean, std } = dsp.robustMeanStd(offs);
   st.scratch[which] = { mean, std, sr };
   $('#cap' + which.toUpperCase()).textContent = `${which === 'a' ? ROLE_LABEL[st.pair.a] : ROLE_LABEL[st.pair.b]}: ${dsp.samplesToMm(mean, sr).toFixed(1)} mm (± ${dsp.samplesToMm(std, sr).toFixed(1)} mm)`;
   $('#cap' + which.toUpperCase()).classList.add('captured');
