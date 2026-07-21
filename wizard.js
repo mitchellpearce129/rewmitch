@@ -210,11 +210,24 @@ function showLevelTest(step, onClose) {
   overlay.querySelector('#lvlHappy').addEventListener('click', close);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
-async function capLinear(step) {
+let driftEnabled = true; // toggled by the self-test's OFF control
+function driftNote(comp) {
+  if (comp.applied) return `Clock drift corrected ${comp.ppm >= 0 ? '+' : ''}${comp.ppm.toFixed(1)} ppm.`;
+  if (comp.reason && comp.reason.includes('deadband')) return 'Clocks in sync.';
+  if (comp.reason && (comp.reason.includes('not found') || comp.reason.includes('implausible'))) return '⚠ Drift not verified (uncorrected).';
+  return '';
+}
+// Linear capture: sweep wrapped in a timing FRAME, recording resampled to undo
+// clock drift before deconvolving the BARE sweep. No-op when clocks are shared.
+async function capLinear(step, durationOverride) {
   const ctx = session.ctx, mic = session.micStream, sr = ctx.sampleRate, s = wizSettings(step);
+  if (durationOverride) s.duration = durationOverride;
   const sweep = dsp.generateESS(s.f1, s.f2, s.duration, sr);
-  const rec = await audio.playAndRecord(ctx, mic, sweep, { tailSec: 1, level: s.level });
-  const ir = dsp.deconvolve(rec, sweep);
+  const frame = dsp.buildTimingFrame(sweep, sr);
+  const rec = await audio.playAndRecord(ctx, mic, frame.signal, { tailSec: 0.15, level: s.level });
+  let usedRec = rec, comp = { applied: false, ppm: 0, reason: 'disabled' };
+  if (driftEnabled) { comp = dsp.compensateDrift(rec, frame.expectedGap, dsp.estimateDrift(rec, frame.marker, sr)); usedRec = comp.recording; }
+  const ir = dsp.deconvolve(usedRec, sweep);
   const peakIdx = dsp.findPeak(ir);
   const gated = dsp.gateIR(ir, peakIdx, sr, s.gatePre, s.gatePost);
   const spec = dsp.spectrum(gated, sr);
@@ -222,7 +235,7 @@ async function capLinear(step) {
   if (session.cal) mag = cal.correctMagnitude(spec.freq, mag, session.cal);
   mag = dsp.fractionalOctaveSmooth(spec.freq, mag, s.smoothing);
   mag = dsp.normaliseToBand(spec.freq, mag);
-  return { freq: spec.freq, mag, phase: spec.phase, gd: dsp.groupDelayMs(spec.freq, spec.phase), ir, peakIdx, sr, rec, sweep };
+  return { freq: spec.freq, mag, phase: spec.phase, gd: dsp.groupDelayMs(spec.freq, spec.phase), ir, peakIdx, sr, drift: comp };
 }
 async function capOffset(refChannel, s) {
   const ctx = session.ctx, mic = session.micStream, sr = ctx.sampleRate;
@@ -520,7 +533,8 @@ async function capPhaseFlow(st, which, plot, refChannel) {
   plot.draw(traces);
   if (st.scratch.a && st.scratch.b) {
     st.scratch.result = { summary: 'phase overlaid', detail: `Compare tracking around ${st.config.xo} Hz.` };
-    $('#wizResult').innerHTML = `<p class="hint">Look at how the two curves line up around <strong>${st.config.xo} Hz</strong>. Tracking together = summing well; a big split or flip = polarity/offset issue.</p>`;
+    const dn = driftNote((st.scratch.b || st.scratch.a).drift);
+    $('#wizResult').innerHTML = `<p class="hint">Look at how the two curves line up around <strong>${st.config.xo} Hz</strong>. Tracking together = summing well; a big split or flip = polarity/offset issue.${dn ? ' <em>' + dn + '</em>' : ''}</p>`;
     $('#wizDone').disabled = false;
   }
 }
@@ -582,6 +596,35 @@ function finishStep(i) {
   st.result = st.scratch.result || { summary: 'done' };
   renderPlan();
 }
+
+// ---- Dev self-test (drift-spec §6) ----------------------------------------
+// Same fixed setup measured at two sweep lengths should overlay if drift is
+// compensated. Run from the browser console: rewmitchDriftSelfTest().
+// Reports group-delay RMS difference (µs) between the short and long sweeps,
+// with drift ON vs OFF. On async clocks ON should be << OFF; on a shared clock
+// both are small (deadband no-op). Needs a live, unchanging mic+speaker setup.
+async function runDriftSelfTest(shortS = 1, longS = 4) {
+  if (!(await ensureAudio())) { console.warn('[drift self-test] enable the mic first'); return; }
+  const step = { testType: 'standard', config: {}, pair: null };
+  const gdRmsMicros = (a, b) => {
+    let s = 0, n = 0;
+    for (let i = 0; i < a.freq.length; i++) { const f = a.freq[i]; if (f < 500 || f > 15000) continue; const d = a.gd[i] - b.gd[i]; s += d * d; n++; }
+    return +(Math.sqrt(s / n) * 1000).toFixed(1);
+  };
+  const out = {};
+  for (const on of [true, false]) {
+    driftEnabled = on;
+    console.log(`[drift self-test] drift ${on ? 'ON' : 'OFF'}: capturing ${shortS}s then ${longS}s…`);
+    const a = await capLinear(step, shortS);
+    const b = await capLinear(step, longS);
+    out[on ? 'ON' : 'OFF'] = { gdRmsMicros: gdRmsMicros(a, b), ppmShort: +(a.drift.ppm || 0).toFixed(1), ppmLong: +(b.drift.ppm || 0).toFixed(1) };
+  }
+  driftEnabled = true;
+  console.log('[drift self-test] GD RMS diff (µs) between sweeps — lower = better overlay:', out);
+  console.log('  PASS if ON.gdRmsMicros << OFF.gdRmsMicros (async clocks), or both small (shared clock).');
+  return out;
+}
+window.rewmitchDriftSelfTest = runDriftSelfTest;
 
 // ---- Boot -----------------------------------------------------------------
 initChips();

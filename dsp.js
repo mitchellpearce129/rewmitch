@@ -326,9 +326,10 @@ export function generateRefMarker(sampleRate, { f1 = 2000, f2 = 4000, durMs = 2 
   return out;
 }
 
-// Matched-filter cross-correlation: sub-sample lag where `template` best aligns
-// inside `signal` (i.e. the template's arrival index). Parabolic-interpolated.
-export function crossCorrPeak(signal, template) {
+// Shared peak-picking helpers (used by the marker cross-correlation, the driver
+// IR peak finder, and drift estimation — factored per the drift-spec DRY note).
+function xcorrArray(signal, template) {
+  const n = signal.length;
   const L = nextPow2(signal.length + template.length);
   const sr = new Float32Array(L), si = new Float32Array(L);
   const tr = new Float32Array(L), ti = new Float32Array(L);
@@ -340,14 +341,44 @@ export function crossCorrPeak(signal, template) {
     ci[i] = si[i] * tr[i] - sr[i] * ti[i]; // Im(S·conj(T))
   }
   ifft(cr, ci);
-  let idx = 0, max = 0;
-  for (let i = 0; i < signal.length; i++) { const a = Math.abs(cr[i]); if (a > max) { max = a; idx = i; } }
-  if (idx > 0 && idx < signal.length - 1) {
-    const a = Math.abs(cr[idx - 1]), b = Math.abs(cr[idx]), c = Math.abs(cr[idx + 1]);
+  return { cr, n };
+}
+function parabolicSub(arr, idx) {
+  if (idx > 0 && idx < arr.length - 1) {
+    const a = Math.abs(arr[idx - 1]), b = Math.abs(arr[idx]), c = Math.abs(arr[idx + 1]);
     const den = a - 2 * b + c;
     if (den !== 0) return idx + (0.5 * (a - c)) / den;
   }
   return idx;
+}
+// Peak index + max + median noise floor over [start,end], excluding a guard band
+// around the peak so the peak itself doesn't inflate the floor.
+function peakAndFloor(arr, start, end, guard) {
+  let idx = start, max = 0;
+  for (let i = start; i <= end; i++) { const a = Math.abs(arr[i]); if (a > max) { max = a; idx = i; } }
+  const mags = [];
+  for (let i = start; i <= end; i++) { if (Math.abs(i - idx) <= guard) continue; mags.push(Math.abs(arr[i])); }
+  mags.sort((a, b) => a - b);
+  return { idx, max, noise: mags.length ? mags[Math.floor(mags.length / 2)] : 0 };
+}
+
+// Matched-filter cross-correlation: sub-sample lag where `template` best aligns
+// inside `signal` (i.e. the template's arrival index). Parabolic-interpolated.
+export function crossCorrPeak(signal, template) {
+  const { cr, n } = xcorrArray(signal, template);
+  let idx = 0, max = 0;
+  for (let i = 0; i < n; i++) { const a = Math.abs(cr[i]); if (a > max) { max = a; idx = i; } }
+  return parabolicSub(cr, idx);
+}
+
+// Cross-correlation peak WITH a prominence SNR (peak vs median correlation floor),
+// so a marker that isn't clearly present can be rejected. Used by estimateDrift.
+export function corrPeakWithSnr(signal, template, sampleRate, guardMs = 1) {
+  const { cr, n } = xcorrArray(signal, template);
+  const guard = Math.round((guardMs / 1000) * sampleRate);
+  const { idx, max, noise } = peakAndFloor(cr, 0, n - 1, guard);
+  const snrDb = noise > 0 ? 20 * Math.log10(max / noise) : Infinity;
+  return { lag: parabolicSub(cr, idx), snrDb };
 }
 
 // Bounded, prominence-checked driver-arrival peak for the offset measurement.
@@ -359,32 +390,10 @@ export function crossCorrPeak(signal, template) {
 export function findDriverPeak(ir, sampleRate, { refLag = 0, maxMs = 40, minSnrDb = 12, guardMs = 1 } = {}) {
   const start = Math.max(0, Math.round(refLag));
   const end = Math.min(ir.length - 1, start + Math.round((maxMs / 1000) * sampleRate));
-
-  let idx = start, max = 0;
-  for (let i = start; i <= end; i++) {
-    const a = Math.abs(ir[i]);
-    if (a > max) { max = a; idx = i; }
-  }
-
-  // Noise floor = median |ir| across the window, excluding a guard band around
-  // the peak so the peak itself doesn't inflate the floor.
   const guard = Math.round((guardMs / 1000) * sampleRate);
-  const mags = [];
-  for (let i = start; i <= end; i++) {
-    if (Math.abs(i - idx) <= guard) continue;
-    mags.push(Math.abs(ir[i]));
-  }
-  mags.sort((a, b) => a - b);
-  const noise = mags.length ? mags[Math.floor(mags.length / 2)] : 0;
+  const { idx, max, noise } = peakAndFloor(ir, start, end, guard);
   const snrDb = noise > 0 ? 20 * Math.log10(max / noise) : Infinity;
-
-  let pos = idx;
-  if (idx > 0 && idx < ir.length - 1) {
-    const a = Math.abs(ir[idx - 1]), b = Math.abs(ir[idx]), c = Math.abs(ir[idx + 1]);
-    const den = a - 2 * b + c;
-    if (den !== 0) pos = idx + (0.5 * (a - c)) / den;
-  }
-  return { pos, snrDb, valid: snrDb >= minSnrDb };
+  return { pos: parabolicSub(ir, idx), snrDb, valid: snrDb >= minSnrDb };
 }
 
 // One self-referenced capture → offset (samples) of driver arrival relative to
@@ -432,6 +441,94 @@ export function robustMeanStd(arr) {
   const keep = sigma > 0 ? arr.filter((v) => Math.abs(v - med) <= 3.5 * sigma) : arr.slice();
   const use = keep.length ? keep : arr;
   return { ...meanStd(use), kept: use.length };
+}
+
+// --- 8d. Clock-drift compensation (dual-marker) ----------------------------
+// When play and record run on separate clocks (e.g. USB-C DAC out + phone mic
+// in), the recording's timebase slowly stretches vs the known sweep, smearing
+// phase/group-delay (worst at HF). A single start marker cancels a CONSTANT
+// offset; drift is a SLOPE, so we place a SECOND marker at the end, measure how
+// far the gap stretched, and resample the recording back to the play clock (same
+// idea as REW's "adjust clock with acoustic reference"). Shared-clock case
+// measures ~0 ppm and is skipped — no-op, no regression.
+
+// Framed playback buffer: [lead][marker@p0][gap][sweep][tail][gap][marker@p1][trail].
+export function buildTimingFrame(sweep, sampleRate, {
+  leadMs = 50, gapMs = 50, tailMs = 150, trailMs = 50, markerOpts = {},
+} = {}) {
+  const marker = generateRefMarker(sampleRate, markerOpts);
+  const ms = (m) => Math.round((m / 1000) * sampleRate);
+  const lead = ms(leadMs), gap = ms(gapMs), tail = ms(tailMs), trail = ms(trailMs);
+  const p0 = lead;
+  const sweepStart = p0 + marker.length + gap;
+  const p1 = sweepStart + sweep.length + tail + gap;
+  const total = p1 + marker.length + trail;
+  const signal = new Float32Array(total);
+  signal.set(marker, p0);
+  signal.set(sweep, sweepStart);
+  signal.set(marker, p1);
+  return { signal, marker, p0, p1, sweepStart, expectedGap: p1 - p0, sampleRate };
+}
+
+// Find both markers (head + tail windows) → measured gap + validity/SNR.
+// NOTE: startWinMs is tighter than the spec's 500 ms so a SHORT sweep's own pass
+// through the marker's 2–4 kHz band can't be mistaken for the start marker.
+export function estimateDrift(recording, marker, sampleRate, {
+  startWinMs = 300, endWinMs = 500, minSnrDb = 10,
+} = {}) {
+  const startWin = Math.min(recording.length, Math.round((startWinMs / 1000) * sampleRate));
+  const endWin = Math.min(recording.length, Math.round((endWinMs / 1000) * sampleRate));
+  const endStart = Math.max(0, recording.length - endWin);
+  const { lag: t0, snrDb: snr0 } = corrPeakWithSnr(recording.subarray(0, startWin), marker, sampleRate);
+  const { lag: t1r, snrDb: snr1 } = corrPeakWithSnr(recording.subarray(endStart), marker, sampleRate);
+  const t1 = endStart + t1r;
+  return { t0, t1, measuredGap: t1 - t0, snr0, snr1, valid: snr0 >= minSnrDb && snr1 >= minSnrDb };
+}
+
+// Arbitrary-ratio windowed-sinc resampler (4-term Blackman–Harris, 32 taps).
+// Output length = round(N/ratio); source position for output m is m*ratio.
+export function resampleWindowedSinc(x, ratio) {
+  const N = x.length;
+  if (ratio === 1) return x.slice();
+  const newLen = Math.round(N / ratio);
+  const y = new Float32Array(newLen);
+  const P = 16;                          // half-width → 32 taps
+  const cutoff = Math.min(1, 1 / ratio); // anti-alias only when downsampling (ρ>1)
+  const sinc = (t) => (t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t));
+  const win = (t) => {
+    if (Math.abs(t) > P) return 0;
+    const a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
+    const x0 = (Math.PI * t) / P;
+    return a0 + a1 * Math.cos(x0) + a2 * Math.cos(2 * x0) + a3 * Math.cos(3 * x0);
+  };
+  for (let m = 0; m < newLen; m++) {
+    const s = m * ratio;
+    const i0 = Math.floor(s);
+    let acc = 0, wsum = 0;
+    for (let k = -P + 1; k <= P; k++) {
+      const idx = i0 + k;
+      if (idx < 0 || idx >= N) continue;
+      const t = s - idx;
+      const c = win(t) * cutoff * sinc(cutoff * t);
+      acc += x[idx] * c;
+      wsum += c;
+    }
+    y[m] = wsum !== 0 ? acc / wsum : 0;
+  }
+  return y;
+}
+
+// Deadband (skip when clocks effectively shared) + sanity ceiling (reject
+// implausible ratios as bad captures). Returns the (possibly resampled) recording.
+export function compensateDrift(recording, expectedGap, drift, {
+  deadbandPpm = 2, maxDriftPpm = 5000,
+} = {}) {
+  if (!drift.valid) return { recording, applied: false, ppm: 0, reason: 'timing markers not found' };
+  const ratio = drift.measuredGap / expectedGap;
+  const ppm = (ratio - 1) * 1e6;
+  if (Math.abs(ppm) > maxDriftPpm) return { recording, applied: false, ppm, reason: 'implausible drift; capture likely bad' };
+  if (Math.abs(ppm) < deadbandPpm) return { recording, applied: false, ppm, reason: 'within deadband (shared clock)' };
+  return { recording: resampleWindowedSinc(recording, ratio), applied: true, ppm, ratio };
 }
 
 // --- 9. Cumulative spectral decay (basic waterfall, spec §5) ---------------

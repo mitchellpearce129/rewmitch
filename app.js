@@ -213,9 +213,25 @@ async function capture(label = 'Measuring…') {
   return { rec, sweep, sr, s };
 }
 
+// Linear measurement (FR / phase / group delay). Plays the sweep wrapped in a
+// timing FRAME (start + end markers) and resamples the recording to undo any
+// play/record clock drift before deconvolving against the BARE sweep. No-op when
+// clocks are shared. (capture() above stays bare — distortion needs the raw sweep.)
+function driftNote(comp) {
+  if (comp.applied) return `· clock drift corrected ${comp.ppm >= 0 ? '+' : ''}${comp.ppm.toFixed(1)} ppm`;
+  if (comp.reason && comp.reason.includes('deadband')) return '· clocks in sync';
+  if (comp.reason && (comp.reason.includes('not found') || comp.reason.includes('implausible'))) return '· ⚠ drift not verified';
+  return '';
+}
 async function measure(label = 'Measuring…') {
-  const { rec, sweep, sr, s } = await capture(label);
-  const ir = dsp.deconvolve(rec, sweep);
+  const s = settings();
+  $('#measureStatus').textContent = label;
+  const sr = state.ctx.sampleRate;
+  const sweep = dsp.generateESS(s.f1, s.f2, s.duration, sr);
+  const frame = dsp.buildTimingFrame(sweep, sr);
+  const rec = await audio.playAndRecord(state.ctx, state.micStream, frame.signal, { tailSec: 0.15, level: s.level });
+  const comp = dsp.compensateDrift(rec, frame.expectedGap, dsp.estimateDrift(rec, frame.marker, sr));
+  const ir = dsp.deconvolve(comp.recording, sweep);
   const peakIdx = dsp.findPeak(ir);
   const gated = dsp.gateIR(ir, peakIdx, sr, s.gatePre, s.gatePost);
   const spec = dsp.spectrum(gated, sr);
@@ -224,7 +240,7 @@ async function measure(label = 'Measuring…') {
   if (s.smoothing > 0) mag = dsp.fractionalOctaveSmooth(spec.freq, mag, s.smoothing);
   mag = dsp.normaliseToBand(spec.freq, mag);
   const gd = dsp.groupDelayMs(spec.freq, spec.phase);
-  $('#measureStatus').textContent = `Done · peak at ${(peakIdx / sr * 1000).toFixed(1)} ms · valid > ${Math.round(dsp.gateFloorHz(s.gatePost))} Hz.`;
+  $('#measureStatus').textContent = `Done · peak at ${(peakIdx / sr * 1000).toFixed(1)} ms · valid > ${Math.round(dsp.gateFloorHz(s.gatePost))} Hz ${driftNote(comp)}`;
   return { ir, peakIdx, freq: spec.freq, mag, phase: spec.phase, gd, sr };
 }
 
