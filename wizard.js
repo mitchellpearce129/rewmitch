@@ -36,6 +36,34 @@ const CONFIGS = [
 const ROLE_LABEL = { tweeter: 'tweeter', midrange: 'midrange', woofer: 'woofer' };
 
 // ---- Per-test beginner copy (Screen 1) ------------------------------------
+// ---- Wiring model (how the drivers must be connected for a test) ----------
+const WIRING = {
+  direct: {
+    key: 'direct', label: 'Direct',
+    short: 'Test driver → amp (crossover bypassed)',
+    long: 'Connect the single driver under test straight to the amp, bypassing the crossover. You are measuring the raw driver on this baffle.',
+    tweeterRisk: true, // raw driver + low content = tweeter danger
+  },
+  throughXO: {
+    key: 'throughXO', label: 'Through crossover',
+    short: 'Test driver → crossover',
+    long: 'Drive the speaker normally, but only the one driver under test is connected downstream of its crossover section. You are measuring that driver through its filter.',
+    tweeterRisk: false, // the series cap in the XO protects the tweeter
+  },
+  fullSystem: {
+    key: 'fullSystem', label: 'Full system',
+    short: 'All drivers → crossover (full system)',
+    long: 'Whole speaker wired and playing as normal, all drivers through the crossover. You are measuring the assembled system response.',
+    tweeterRisk: false,
+  },
+};
+const WIRING_DEFAULT = {
+  driverOffset: 'throughXO', relativePhase: 'throughXO', distortion: 'direct',
+  waterfall: 'direct', comparativeMagnitude: 'fullSystem', nearfield: 'direct',
+};
+function stepWiring(st) { return (st.config && st.config.wiring) || WIRING_DEFAULT[st.testType] || 'fullSystem'; }
+function tweeterCapRequired(st) { return pairHasTweeter(st) && WIRING[stepWiring(st)].tweeterRisk; }
+
 const META = {
   driverOffset: {
     title: 'Driver offset', needsRef: true, pairTest: true,
@@ -135,18 +163,68 @@ function wizSettings(step) {
   return { f1: c.f1 || 20, f2: c.f2 || 20000, duration: 5, level: 0.5, gatePre: 1, gatePost: step && step.testType === 'nearfield' ? 25 : 5, smoothing: 6 };
 }
 
+// ---- REWINA narration engine (optional audio guidance) --------------------
+// Queued speech so multi-line narration doesn't cut itself off. `force` speaks
+// even when guidance is off — reserved for safety lines and level-test cues.
+const narration = { enabled: false, voice: null, voiceName: null, queue: [], speaking: false };
+try {
+  narration.enabled = localStorage.getItem('rewina.enabled') === '1';
+  narration.voiceName = localStorage.getItem('rewina.voice') || null;
+} catch (_) { /* localStorage may be unavailable */ }
+
+function pickVoice() {
+  const vs = (window.speechSynthesis && window.speechSynthesis.getVoices) ? window.speechSynthesis.getVoices() : [];
+  if (narration.voiceName) { const m = vs.find((v) => v.name === narration.voiceName); if (m) return m; }
+  return vs.find((v) => /female|samantha|karen|serena|moira|tessa|zira|aria|fiona/i.test(v.name) && /en/i.test(v.lang))
+    || vs.find((v) => /en/i.test(v.lang)) || vs[0] || null;
+}
+function drainQueue() {
+  if (narration.speaking || !narration.queue.length) return;
+  narration.speaking = true;
+  window.speechSynthesis.speak(narration.queue.shift());
+}
+function say(text, { force = false } = {}) {
+  if (!window.speechSynthesis || !text) return;
+  if (!narration.enabled && !force) return;
+  if (!narration.voice) narration.voice = pickVoice();
+  const u = new SpeechSynthesisUtterance(text);
+  if (narration.voice) u.voice = narration.voice;
+  u.rate = 1.0; u.pitch = 1.0;
+  u.onend = () => { narration.speaking = false; drainQueue(); };
+  u.onerror = () => { narration.speaking = false; drainQueue(); };
+  narration.queue.push(u);
+  drainQueue();
+}
+function stopSpeaking() {
+  try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (_) {}
+  narration.queue = []; narration.speaking = false;
+}
+function speak(text) { say(text, { force: true }); } // legacy short cues (level test)
+if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = () => { narration.voice = pickVoice(); };
+
+// Render chip-laden guide copy down to plain text for speech.
+function stripChips(html) {
+  return html.replace(/<sup>.*?<\/sup>/g, '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+const REWINA_INTRO = "Hi, my name is REWINA and I'll be guiding you through your speaker measurement test plan. "
+  + "If my voice sounds like a normal conversation, your device and amp volumes are in a sensible range. "
+  + "If I'm too soft, turn your device volume up; if I'm blaring, turn it down. "
+  + "This is only a rough check — for the real levels, use the Test levels button and watch the input meter. "
+  + "When you're ready, head to the first test.";
+// Assemble a step's spoken script: purpose + wiring + (forced) safety.
+function narrate(st) {
+  const m = META[st.testType];
+  const w = WIRING[stepWiring(st)];
+  say(`Next up: ${m.title}.`);
+  say(stripChips(m.for));
+  say(`Wiring for this test: ${w.short}. ${w.long}`);
+  if (tweeterCapRequired(st)) {
+    say('Safety check: this connects the tweeter with no crossover protection. Make sure you have a capacitor in series before you play any sweep.', { force: true });
+  }
+}
+
 // ---- Level-setting routine (Test levels) ----------------------------------
 const levelTest = { running: false, cur: null };
-function speak(text) {
-  try {
-    if (window.speechSynthesis) {
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1;
-      window.speechSynthesis.speak(u);
-    }
-  } catch (_) { /* speech optional */ }
-}
 async function runLevelTest(step, statusEl) {
   if (!(await ensureAudio())) { statusEl.textContent = 'Enable the mic/audio first (a permission prompt should appear).'; return; }
   const ctx = session.ctx, sr = ctx.sampleRate;
@@ -203,7 +281,7 @@ function showLevelTest(step, onClose) {
   const close = () => {
     levelTest.running = false;
     if (levelTest.cur) levelTest.cur.stop();
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    stopSpeaking();
     overlay.remove();
     if (onClose) onClose();
   };
@@ -324,13 +402,34 @@ function renderPlan() {
 }
 
 // Screen 1 — info / setup
+function wiringBannerHtml(st) {
+  const wk = stepWiring(st);
+  const w = WIRING[wk];
+  const chips = ['direct', 'throughXO', 'fullSystem'].map((k) =>
+    `<button class="wire-chip${k === wk ? ' active' : ''}" data-wire="${k}">${WIRING[k].label}</button>`).join('');
+  const capWarn = tweeterCapRequired(st)
+    ? `<div class="cap-warn">⚠ TWEETER: this wiring connects the tweeter with no crossover protection. You MUST
+        have a ${chip('protectionCap', 'capacitor in series')} — a raised sweep-start frequency is NOT enough.
+        Do not proceed otherwise.</div>`
+    : '';
+  return `<div class="wire-banner">
+      <div class="wire-title">🔌 WIRING: ${w.short}</div>
+      <div class="wire-long">${w.long}</div>
+      <div class="wire-chips">${chips}</div>
+      ${capWarn}
+    </div>`;
+}
+
 function renderInfo(i) {
+  stopSpeaking();
   const st = wiz.plan.steps[i], m = META[st.testType];
   const pairNote = st.pair && st.pair.note ? `<p class="hint">📍 ${st.pair.note}</p>` : '';
   render(`
     <div class="card wiz-screen">
-      <div class="wiz-crumbs">Step ${i + 1} of ${wiz.plan.steps.length} · ${m.title}${st.pair ? ' — ' + st.pair.name : ''}</div>
+      <div class="wiz-crumbs">Step ${i + 1} of ${wiz.plan.steps.length} · ${m.title}${st.pair ? ' — ' + st.pair.name : ''}
+        <button id="wizNarrate" class="narrate-btn" title="Play / stop narration">🔊</button></div>
       <h2>${m.title}</h2>
+      <div id="wireBanner">${wiringBannerHtml(st)}</div>
       <div class="wiz-sec"><h3>What it's for</h3><p>${m.for}</p></div>
       <div class="wiz-sec"><h3>What you'll produce</h3><p>${m.produce}</p></div>
       <div class="wiz-sec"><h3>How you'll use it</h3><p>${m.use}</p></div>
@@ -342,8 +441,31 @@ function renderInfo(i) {
         <button id="wizReady" class="primary">Ready</button>
       </div>
     </div>`);
-  $('#wizBack').addEventListener('click', renderPlan);
-  $('#wizReady').addEventListener('click', () => renderConfig(i));
+  const rewireBanner = () => {
+    $('#wireBanner').innerHTML = wiringBannerHtml(st);
+    bindWireChips();
+  };
+  function bindWireChips() {
+    host().querySelectorAll('.wire-chip').forEach((b) => b.addEventListener('click', () => {
+      st.config.wiring = b.dataset.wire;
+      rewireBanner();
+    }));
+  }
+  bindWireChips();
+  $('#wizBack').addEventListener('click', () => { stopSpeaking(); renderPlan(); });
+  $('#wizReady').addEventListener('click', () => { stopSpeaking(); renderConfig(i); });
+  $('#wizNarrate').addEventListener('click', () => {
+    if (narration.speaking) { stopSpeaking(); return; }
+    // On-demand replay works even if guidance is off.
+    const wasEnabled = narration.enabled; narration.enabled = true;
+    narrate(st);
+    narration.enabled = wasEnabled;
+  });
+  if (narration.enabled) narrate(st); // auto-narrate on entry when guidance is on
+  // The tweeter-cap safety line is voiced even when guidance is off (narrate forces it).
+  if (!narration.enabled && tweeterCapRequired(st)) {
+    say('Safety check: this connects the tweeter with no crossover protection. Make sure you have a capacitor in series before you play any sweep.', { force: true });
+  }
 }
 
 // Screen 2 — data entry / configuration
@@ -399,6 +521,7 @@ function renderConfig(i) {
 
 // Screen 3 — capture + result
 function renderCapture(i) {
+  stopSpeaking();
   const st = wiz.plan.steps[i], m = META[st.testType];
   const cfg = st.config;
   ensureRange(st);
@@ -451,10 +574,13 @@ function renderCapture(i) {
 async function runCapture(i, which, plot, refChannel) {
   const st = wiz.plan.steps[i], m = META[st.testType];
   if (!(await ensureAudio())) { $('#wizStatus').textContent = 'Please enable the mic (a permission prompt should appear).'; return; }
-  // P0 gate: fires when the driver being played is a tweeter (offset/phase).
+  // P0 gate: fires when the tweeter is being played on RISK wiring (direct/no XO
+  // cap). Through-crossover keeps the series cap in place, so no gate needed.
   if (m.pairTest) {
     const role = which === 'a' ? st.pair.a : which === 'b' ? st.pair.b : st.pair.a;
-    if (!(await passesTweeterGate(role))) return;
+    if (role === 'tweeter' && WIRING[stepWiring(st)].tweeterRisk) {
+      if (!(await passesTweeterGate(role))) return;
+    }
   }
   const btns = host().querySelectorAll('[data-cap]'); btns.forEach((b) => (b.disabled = true));
   try {
@@ -626,6 +752,33 @@ async function runDriftSelfTest(shortS = 1, longS = 4) {
 }
 window.rewmitchDriftSelfTest = runDriftSelfTest;
 
+// ---- REWINA settings (Setup/Help tab) -------------------------------------
+function setupRewinaControls() {
+  const toggle = $('#rewinaToggle'), voiceSel = $('#rewinaVoice'), testBtn = $('#rewinaTest');
+  if (!toggle) return;
+  toggle.checked = narration.enabled;
+  const populateVoices = () => {
+    if (!voiceSel) return;
+    const vs = (window.speechSynthesis && window.speechSynthesis.getVoices) ? window.speechSynthesis.getVoices().filter((v) => /en/i.test(v.lang)) : [];
+    voiceSel.innerHTML = '<option value="">Auto (REWINA default)</option>'
+      + vs.map((v) => `<option value="${v.name}"${v.name === narration.voiceName ? ' selected' : ''}>${v.name}</option>`).join('');
+  };
+  populateVoices();
+  if (window.speechSynthesis && window.speechSynthesis.addEventListener) window.speechSynthesis.addEventListener('voiceschanged', populateVoices);
+  toggle.addEventListener('change', () => {
+    narration.enabled = toggle.checked;
+    try { localStorage.setItem('rewina.enabled', narration.enabled ? '1' : '0'); } catch (_) {}
+    if (narration.enabled) { narration.voice = pickVoice(); say(REWINA_INTRO); } else stopSpeaking();
+  });
+  if (voiceSel) voiceSel.addEventListener('change', () => {
+    narration.voiceName = voiceSel.value || null; narration.voice = pickVoice();
+    try { localStorage.setItem('rewina.voice', narration.voiceName || ''); } catch (_) {}
+    say('This is REWINA.', { force: true });
+  });
+  if (testBtn) testBtn.addEventListener('click', () => { narration.voice = pickVoice(); say(REWINA_INTRO, { force: true }); });
+}
+
 // ---- Boot -----------------------------------------------------------------
 initChips();
+setupRewinaControls();
 renderStart();

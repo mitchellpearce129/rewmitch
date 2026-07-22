@@ -12,9 +12,17 @@ export class Plot {
     this.yMin = -30;
     this.yMax = 15;
     this.yLabel = 'dB (relative)';
+    this._traces = [];
     this._resize();
     window.addEventListener('resize', () => { this._resize(); this._redraw(); });
-    this._traces = [];
+    // A canvas constructed inside a hidden (display:none) tab measures 0×0 and
+    // never re-measures on a plain tab switch — which left Measure-tab plots
+    // drawing into a 1×1 buffer (blank). Observe the element so it re-sizes and
+    // redraws whenever it actually gains/changes size (tab shown, rotate, resize).
+    if (typeof ResizeObserver !== 'undefined') {
+      this._ro = new ResizeObserver(() => { this._resize(); this._redraw(); });
+      this._ro.observe(this.canvas);
+    }
   }
 
   _resize() {
@@ -35,8 +43,12 @@ export class Plot {
   // traces: [{ freq, values, color, name, visible }]
   draw(traces) {
     this._traces = traces;
-    this._redraw();
+    this._resize();   // re-measure at draw time — the canvas may have been built
+    this._redraw();   // while its tab was hidden (0×0); by now it's visible.
   }
+
+  // Re-measure + repaint (e.g. when a tab becomes visible with traces already held).
+  refresh() { this._resize(); this._redraw(); }
 
   _redraw() {
     const { ctx } = this;

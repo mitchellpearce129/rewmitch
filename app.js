@@ -54,6 +54,8 @@ document.querySelectorAll('.tabs button').forEach((b) => {
     b.classList.add('active');
     $('#tab-' + b.dataset.tab).classList.add('active');
     if (b.dataset.tab === 'traces') renderTraceList();
+    if (b.dataset.tab === 'measure') plot.refresh(); // canvas was 0×0 while hidden — re-measure now
+
   });
 });
 
