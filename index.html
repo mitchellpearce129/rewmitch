@@ -53,7 +53,15 @@
         <button id="calClear" class="secondary cal-clear">Clear</button>
       </div>
       <p id="calStatus" class="hint">No calibration loaded — measurements are relative (uncalibrated mic).
-        Load a UMIK/REW <code>.txt</code>/<code>.frd</code> to correct magnitude.</p>
+        Load a UMIK/REW <code>.txt</code>/<code>.frd</code> to correct magnitude (and phase, if the file has it).</p>
+      <div class="cal-row" style="margin-top:8px">
+        <label class="file-btn">🔊 Load soundcard/DAC calibration file
+          <input id="calFileSc" type="file" accept=".txt,.frd,.cal,.csv,text/plain" hidden />
+        </label>
+        <button id="calClearSc" class="secondary cal-clear">Clear</button>
+      </div>
+      <p id="calStatusSc" class="hint">No soundcard/DAC calibration loaded (a good USB DAC is essentially flat, and it
+        cancels in relative/A-B/timing results — this only refines the absolute magnitude shape).</p>
     </div>
 
     <div class="card">
@@ -199,6 +207,15 @@
       <label class="driver-type-row">Voice
         <select id="rewinaVoice"><option value="">Auto (REWINA default)</option></select></label>
       <button id="rewinaTest" class="secondary" style="margin-top:8px">🔊 Test my levels with REWINA</button>
+    </div>
+    <div class="card">
+      <h2>Diagnostics — clock-drift self-test</h2>
+      <p class="hint">Runs the SAME fixed setup at two sweep lengths (1 s &amp; 4 s) with drift compensation
+        ON and OFF, and reports the group-delay difference. On async clocks (USB DAC + phone mic) the ON
+        result should be far smaller than OFF; on a shared clock both are tiny. Needs the mic enabled and
+        a fixed, unchanging mic+speaker setup. Takes ~4 sweeps.</p>
+      <button id="driftSelfTest" class="secondary">Run clock-drift self-test</button>
+      <p id="driftSelfTestStatus" class="hint"></p>
     </div>
   </section>
 

@@ -57,3 +57,33 @@ export function correctMagnitude(freqArr, magDb, cal) {
   for (let i = 0; i < freqArr.length; i++) out[i] = magDb[i] - calValueAt(cal, freqArr[i]);
   return out;
 }
+
+// Interpolated phase correction (radians) at f, or 0 if the file has no phase.
+export function calPhaseRadAt(cal, f) {
+  if (!cal || !cal.phase) return 0;
+  const xs = cal.freq, ys = cal.phase, n = xs.length;
+  let v;
+  if (f <= xs[0]) v = ys[0];
+  else if (f >= xs[n - 1]) v = ys[n - 1];
+  else {
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (xs[mid] <= f) lo = mid; else hi = mid; }
+    const t = (f - xs[lo]) / (xs[hi] - xs[lo]);
+    v = ys[lo] + t * (ys[hi] - ys[lo]);
+  }
+  return (v * Math.PI) / 180; // cal phase is in degrees
+}
+
+// Apply one or more calibrations (mic, soundcard/DAC) IN PLACE: subtract each
+// device's magnitude deviation from magDb, and — if the file carries phase —
+// its phase deviation from phaseRad. Nulls in `cals` are skipped.
+export function applyCalibrations(freqArr, magDb, phaseRad, cals) {
+  for (const cal of cals) {
+    if (!cal) continue;
+    for (let i = 0; i < freqArr.length; i++) {
+      magDb[i] -= calValueAt(cal, freqArr[i]);
+      if (cal.phase && phaseRad) phaseRad[i] -= calPhaseRadAt(cal, freqArr[i]);
+    }
+  }
+  return magDb;
+}

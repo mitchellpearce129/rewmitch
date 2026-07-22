@@ -29,11 +29,13 @@ const state = {
   offset: { useRef: true, refChannel: 'L', averages: 8, dataA: null, dataB: null },
   maxHarmonic: 5,
   cal: null, // parsed mic calibration, or null
+  calSoundcard: null, // parsed soundcard/DAC calibration, or null
 };
 
-// Correction fn for the current cal file (dB to subtract at a given Hz), or null.
+// Combined dB-to-subtract fn (mic + soundcard) for the distortion path, or null.
 function calFn() {
-  return state.cal ? (f) => cal.calValueAt(state.cal, f) : null;
+  if (!state.cal && !state.calSoundcard) return null;
+  return (f) => (state.cal ? cal.calValueAt(state.cal, f) : 0) + (state.calSoundcard ? cal.calValueAt(state.calSoundcard, f) : 0);
 }
 
 // PRIORITY 0 tweeter gate now lives in safety.js (shared with the wizard).
@@ -190,6 +192,28 @@ $('#calClear').addEventListener('click', () => {
   $('#calStatus').classList.remove('captured');
 });
 
+// ---------- Soundcard / DAC calibration file ----------
+$('#calFileSc').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    state.calSoundcard = cal.parseCalFile(await file.text());
+    session.calSoundcard = state.calSoundcard;
+    $('#calStatusSc').textContent = `✓ ${file.name} · ${state.calSoundcard.points} points. Output chain now corrected too.`;
+    $('#calStatusSc').classList.add('captured');
+  } catch (err) {
+    state.calSoundcard = null; session.calSoundcard = null;
+    $('#calStatusSc').textContent = `Could not read that file: ${err.message}`;
+    $('#calStatusSc').classList.remove('captured');
+  }
+});
+$('#calClearSc').addEventListener('click', () => {
+  state.calSoundcard = null; session.calSoundcard = null;
+  $('#calFileSc').value = '';
+  $('#calStatusSc').textContent = 'No soundcard/DAC calibration loaded (a good USB DAC is essentially flat).';
+  $('#calStatusSc').classList.remove('captured');
+});
+
 function startMeter() {
   if (state.stopMeter) state.stopMeter();
   state.stopMeter = audio.startLevelMeter(state.ctx, state.micStream, ({ peak }) => {
@@ -238,7 +262,8 @@ async function measure(label = 'Measuring…') {
   const gated = dsp.gateIR(ir, peakIdx, sr, s.gatePre, s.gatePost);
   const spec = dsp.spectrum(gated, sr);
   let mag = spec.mag;
-  if (state.cal) mag = cal.correctMagnitude(spec.freq, mag, state.cal); // mic-correct first
+  // Apply mic + soundcard calibration (magnitude, and phase if the file has it).
+  cal.applyCalibrations(spec.freq, mag, spec.phase, [state.cal, state.calSoundcard]);
   if (s.smoothing > 0) mag = dsp.fractionalOctaveSmooth(spec.freq, mag, s.smoothing);
   mag = dsp.normaliseToBand(spec.freq, mag);
   const gd = dsp.groupDelayMs(spec.freq, spec.phase);

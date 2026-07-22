@@ -310,7 +310,7 @@ async function capLinear(step, durationOverride) {
   const gated = dsp.gateIR(ir, peakIdx, sr, s.gatePre, s.gatePost);
   const spec = dsp.spectrum(gated, sr);
   let mag = spec.mag;
-  if (session.cal) mag = cal.correctMagnitude(spec.freq, mag, session.cal);
+  cal.applyCalibrations(spec.freq, mag, spec.phase, [session.cal, session.calSoundcard]);
   mag = dsp.fractionalOctaveSmooth(spec.freq, mag, s.smoothing);
   mag = dsp.normaliseToBand(spec.freq, mag);
   return { freq: spec.freq, mag, phase: spec.phase, gd: dsp.groupDelayMs(spec.freq, spec.phase), ir, peakIdx, sr, drift: comp };
@@ -373,6 +373,26 @@ function renderGlossary() {
   $('#wizBack').addEventListener('click', () => (wiz.plan ? renderPlan() : renderStart()));
 }
 
+// Plain-text results summary for the completion email.
+function planResultsText() {
+  const p = wiz.plan;
+  const L = [`Congratulations — you've completed your ${p.config} speaker test plan.`, ''];
+  const offs = p.steps.filter((s) => s.testType === 'driverOffset' && s.status === 'done' && s.result);
+  if (offs.length) {
+    L.push('Your measured driver offsets and error bars:');
+    offs.forEach((s) => L.push(`  • ${s.pair ? s.pair.name : 'offset'}: ${s.result.summary}`));
+    L.push('');
+  }
+  const others = p.steps.filter((s) => s.status === 'done' && s.result && s.testType !== 'driverOffset');
+  if (others.length) {
+    L.push('Other completed tests:');
+    others.forEach((s) => L.push(`  • ${META[s.testType].title}${s.pair ? ' (' + s.pair.name + ')' : ''}: ${s.result.summary}`));
+    L.push('');
+  }
+  L.push('Measured with REWMitch — https://mitchellpearce129.github.io/rewmitch/');
+  return L.join('\n');
+}
+
 function renderPlan() {
   const p = wiz.plan;
   const rows = p.steps.map((st, i) => {
@@ -394,11 +414,26 @@ function renderPlan() {
         <button id="wizRestart" class="secondary">Start over</button>
       </div>
       <button id="wizGloss2" class="secondary" style="margin-top:8px">Glossary</button>
+      ${p.steps.some((s) => s.status === 'done') ? `
+      <div class="email-block">
+        <label class="driver-type-row">✉ Email me my results (optional)
+          <input id="planEmail" type="email" inputmode="email" placeholder="you@example.com" /></label>
+        <p class="hint">Your address is <strong>not stored and never sent to us</strong> — this just opens
+          your own mail app with the results filled in. (Results go in the email body; the app can't
+          attach files without a server.)</p>
+        <button id="emailResults" class="secondary">Compose results email</button>
+      </div>` : ''}
     </div>`);
   document.querySelectorAll('.plan-step').forEach((b) => b.addEventListener('click', () => renderInfo(+b.dataset.i)));
   if (firstPending >= 0) $('#wizContinue').addEventListener('click', () => renderInfo(firstPending));
   $('#wizRestart').addEventListener('click', () => { wiz.plan = null; wiz.config = null; renderStart(); });
   $('#wizGloss2').addEventListener('click', renderGlossary);
+  const emailBtn = $('#emailResults');
+  if (emailBtn) emailBtn.addEventListener('click', () => {
+    const addr = ($('#planEmail').value || '').trim();
+    const subject = `REWMitch — your ${p.config} test plan results`;
+    window.location.href = `mailto:${encodeURIComponent(addr)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(planResultsText())}`;
+  });
 }
 
 // Screen 1 — info / setup
@@ -487,7 +522,7 @@ function renderConfig(i) {
           <option value="L"${cfg.testSpeaker === 'L' ? ' selected' : ''}>Left</option>
           <option value="R"${cfg.testSpeaker === 'R' ? ' selected' : ''}>Right</option>
         </select></label>
-      ${m.needsRef ? `<p class="hint">Reference = your <strong>other</strong> speaker (the ${cfg.testSpeaker === 'L' ? 'right' : 'left'} one), left where it is. It fires the timing marker so the tablet's audio delay cancels.</p>` : ''}
+      ${m.needsRef ? `<p class="hint">Reference = your <strong>other</strong> speaker (the ${cfg.testSpeaker === 'L' ? 'right' : 'left'} one), left where it is; it must reproduce the 2–4 kHz marker. It fires the timing marker so the tablet's audio delay cancels. <strong>Needs true stereo output</strong> — if you hear the marker AND sweep from both speakers, your output is summing to mono; use <em>Test reference</em> to confirm the marker comes only from the reference speaker.</p>` : ''}
       ${st.pair ? `<p class="hint">This pair meets at their ${chip('crossoverFreq', 'crossover')}. We only trust the result across the range where both drivers actually play — around the crossover.</p>
         <label class="driver-type-row">Crossover frequency (Hz)
           <input id="cfgXo" type="number" min="100" max="15000" value="${cfg.xo}"/></label>` : ''}
@@ -669,7 +704,7 @@ async function capDistortionFlow(st, plot) {
   $('#wizStatus').textContent = 'Capturing…';
   const sweep = dsp.generateESS(s.f1, s.f2, s.duration, sr);
   const rec = await audio.playAndRecord(ctx, mic, sweep, { tailSec: 1, level: s.level });
-  const d = dsp.harmonicDistortion(rec, sweep, s.f1, s.f2, s.duration, sr, { maxHarmonic: 5, preMs: s.gatePre, postMs: s.gatePost, calFn: session.cal ? (f) => cal.calValueAt(session.cal, f) : null });
+  const d = dsp.harmonicDistortion(rec, sweep, s.f1, s.f2, s.duration, sr, { maxHarmonic: 5, preMs: s.gatePre, postMs: s.gatePost, calFn: (session.cal || session.calSoundcard) ? (f) => (session.cal ? cal.calValueAt(session.cal, f) : 0) + (session.calSoundcard ? cal.calValueAt(session.calSoundcard, f) : 0) : null });
   const shift = (a) => { const v = new Float32Array(a.length); for (let j = 0; j < a.length; j++) v[j] = a[j] - d.ref; return v; };
   const traces = [{ freq: d.freq, values: shift(d.fundamentalDb), color: '#fff', name: 'fundamental', visible: true }];
   d.harmonics.forEach((h, idx) => traces.push({ freq: d.freq, values: shift(h.mag), color: TRACE_COLORS[idx], name: 'H' + h.n, visible: true }));
@@ -776,6 +811,22 @@ function setupRewinaControls() {
     say('This is REWINA.', { force: true });
   });
   if (testBtn) testBtn.addEventListener('click', () => { narration.voice = pickVoice(); say(REWINA_INTRO, { force: true }); });
+
+  const dst = $('#driftSelfTest'), dstStatus = $('#driftSelfTestStatus');
+  if (dst) dst.addEventListener('click', async () => {
+    dst.disabled = true;
+    if (dstStatus) dstStatus.textContent = 'Running… 4 sweeps (1 s & 4 s, drift ON then OFF). Keep everything still.';
+    try {
+      const res = await runDriftSelfTest();
+      if (!res) { if (dstStatus) dstStatus.textContent = 'Enable the mic first (Measure tab → Enable Mic & Audio), then retry.'; return; }
+      const verdict = res.ON.gdRmsMicros < res.OFF.gdRmsMicros * 0.6
+        ? '✅ compensation is clearly helping (async clocks).'
+        : 'ℹ little/no drift detected — likely a shared clock (no-op is correct).';
+      if (dstStatus) dstStatus.textContent = `ON: ${res.ON.gdRmsMicros} µs (drift ${res.ON.ppmShort}/${res.ON.ppmLong} ppm) · OFF: ${res.OFF.gdRmsMicros} µs. ${verdict}`;
+    } catch (e) {
+      if (dstStatus) dstStatus.textContent = 'Error: ' + e.message;
+    } finally { dst.disabled = false; }
+  });
 }
 
 // ---- Boot -----------------------------------------------------------------

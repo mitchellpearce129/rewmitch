@@ -240,3 +240,7 @@ footer { color: var(--danger); font-size: 12px; text-align: center; margin-top: 
 .qa .a { font-size: 13px; color: var(--muted); margin: 0; }
 .qa .a em, ul.help em { color: var(--accent-2); font-style: italic; }
 ul.refs li { font-size: 12.5px; }
+
+.email-block { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--card-border); }
+.email-block input { width: 100%; }
+.email-block button { width: 100%; margin-top: 6px; }
